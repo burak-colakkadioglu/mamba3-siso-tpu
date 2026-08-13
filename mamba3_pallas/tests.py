@@ -1169,6 +1169,36 @@ def stage_pretrained(env: Env, rep: Report) -> None:
         0.0 if bool(jnp.isfinite(got_bf16).all()) else 1.0, 1e-12,
     )
 
+    # `train.generate` drives arbitrary token ids, which is what a real tokenizer needs.
+    # Byte-level sampling never exercises a vocab wider than 256, nor the path where the
+    # prompt is shorter than one chunk and has to go entirely through the decode kernel.
+    try:
+        from . import train as T
+    except ImportError as exc:                  # optax missing
+        rep.note("pretrained", f"generate skipped: {exc}")
+        return
+
+    ids = [7, 11, 42]
+    out = T.generate(
+        params, cfg, jax.random.key(0), ids, n_tokens=4,
+        rep_penalty=1.0, interpret=env.interpret,
+    )
+    rep.check("pretrained", "generate keeps the prompt",
+              0.0 if out[: len(ids)] == ids else 1.0, 1e-12)
+    rep.check("pretrained", "generate returns prompt + n", abs(len(out) - len(ids) - 4),
+              1e-12)
+    rep.check(
+        "pretrained", "generated ids within vocab",
+        0.0 if all(0 <= t < cfg.vocab_size for t in out) else 1.0, 1e-12,
+    )
+    stopped = T.generate(
+        params, cfg, jax.random.key(0), ids, n_tokens=8,
+        stop_ids=set(range(cfg.vocab_size)), interpret=env.interpret,
+    )
+    rep.check("pretrained", "stop_ids ends generation", abs(len(stopped) - len(ids) - 1),
+              1e-12)
+
+
 
 
 

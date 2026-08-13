@@ -128,6 +128,28 @@ Tokenizer is not in those repos, they point at `meta-llama/Llama-3.1-8B`, which 
 MIMO checkpoints and hybrid attention stacks are refused with a clear error rather than
 half loaded.
 
+Generating from one, through the decode kernel:
+
+```python
+from transformers import AutoTokenizer
+from mamba3_pallas import convert as CV, train as T
+import jax
+
+tk = AutoTokenizer.from_pretrained("meta-llama/Llama-3.1-8B")
+params, cfg = CV.load_pretrained("state-spaces/mamba3-siso-1.5b")
+
+ids = T.generate(
+    params, cfg, jax.random.key(0),
+    prompt_ids=tk.encode("The capital of France is"),
+    n_tokens=100, temperature=0.8, rep_penalty=1.0,
+    stop_ids={tk.eos_token_id},
+)
+print(tk.decode(ids))
+```
+
+`generate` works on token ids so any tokenizer drives it. `train.sample` is the byte level
+wrapper over it, which is what the byte models here use.
+
 Single layer, from a raw `state_dict`:
 
 ```python
@@ -142,9 +164,9 @@ python -m mamba3_pallas.tests          # CPU, interpret mode
 python -m mamba3_pallas.tests --tpu    # real shapes, needs a TPU
 ```
 
-All pass on a v5e-8. Almost all of it also passes with no TPU at all, 114 checks: `lower` 40,
+All pass on a v5e-8. Almost all of it also passes with no TPU at all, 118 checks: `lower` 40,
 `shapes` 8, `refs` 4, `rotation` 4, `forward` 13, `backward` 13, `segments` 6, `torch` 3,
-`checkpoint` 14, `pretrained` 9. That is every stage except `decode` and `train`, which are
+`checkpoint` 14, `pretrained` 13. That is every stage except `decode` and `train`, which are
 too slow in interpret mode to sit in a quick run. Run them yourself:
 
 ```bash

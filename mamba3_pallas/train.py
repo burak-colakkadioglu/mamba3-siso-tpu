@@ -403,6 +403,88 @@ def _pick_token(
     return jax.random.categorical(key, lg) % vocab
 
 
+def generate(
+    params: M.LMParams,
+    cfg: M.LMConfig,
+    key: jax.Array,
+    prompt_ids: "np.ndarray | list[int]",
+    n_tokens: int = 192,
+    temperature: float = 0.9,
+    top_p: float = 0.95,
+    rep_penalty: float = 1.15,
+    rep_window: int = 64,
+    stop_ids: "set[int] | None" = None,
+    interpret: Any = False,
+    on_token=None,
+) -> list[int]:
+    """Generate token ids: chunked prefill, then `model.lm_decode_step` per token.
+
+    Vocabulary agnostic, so this drives a real tokenizer's ids as happily as raw bytes.
+    `sample` is the byte-level wrapper around it.
+
+    Prefill takes the prompt in whole ``chunk`` blocks and feeds the remainder through the
+    decode path one token at a time. The kernel needs a multiple of ``chunk``, and the
+    obvious fix of left-padding with zeros would write ``chunk - len(prompt)`` junk tokens
+    into the state before the real ones. For a 6 token prompt at chunk 128 that is 122
+    tokens of garbage conditioning the model, which is worse than a slightly slower start.
+
+    Args:
+      prompt_ids: At least one token. The last one is what the first step predicts from.
+      stop_ids: Generation ends early if one of these is produced, e.g. an EOS id.
+      on_token: Called with each new id as it arrives, for streaming output.
+
+    Returns:
+      The prompt ids followed by the generated ones.
+    """
+    ids = [int(t) for t in np.asarray(prompt_ids).reshape(-1)]
+    if not ids:
+        raise ValueError("prompt_ids is empty; at least one token is needed")
+    chunk = cfg.siso.chunk
+
+    prefill = jax.jit(functools.partial(M.lm_forward, cfg=cfg, interpret=interpret))
+    step = jax.jit(functools.partial(M.lm_decode_step, cfg=cfg, interpret=interpret))
+
+    states = M.zero_states(cfg, 1)
+    n_whole = (len(ids) - 1) // chunk * chunk      # keep >= 1 token for the step path
+    last = None
+    if n_whole:
+        logits, states = prefill(
+            params, jnp.asarray([ids[:n_whole]], jnp.int32), states=states
+        )
+        last = logits[0, -1]
+    for t in ids[n_whole:]:
+        logits, states = step(params, jnp.asarray([t], jnp.int32), states)
+        last = logits[0]
+
+    filt = jnp.asarray([temperature, top_p, rep_penalty], jnp.float32)
+    # Fixed-size mask updated on the host as a ring buffer. A variable-length index array
+    # would re-trace `_pick_token` on every distinct window size.
+    seen = np.zeros(cfg.vocab_size, bool)
+    window: list[int] = ids[-rep_window:]
+    for t in window:
+        seen[t] = True
+
+    out = list(ids)
+    window = list(window)
+    for _ in range(n_tokens):
+        key, sub = jax.random.split(key)
+        nxt = int(_pick_token(last, jnp.asarray(seen), sub, filt, cfg.vocab_size))
+        out.append(nxt)
+        if on_token is not None:
+            on_token(nxt)
+        if stop_ids and nxt in stop_ids:
+            break
+        window.append(nxt)
+        if len(window) > rep_window:
+            dropped = window.pop(0)
+            if dropped not in window:
+                seen[dropped] = False
+        seen[nxt] = True
+        logits, states = step(params, jnp.asarray([nxt], jnp.int32), states)
+        last = logits[0]
+    return out
+
+
 def sample(
     params: M.LMParams,
     cfg: M.LMConfig,
@@ -418,66 +500,31 @@ def sample(
 ) -> bytes:
     """Generate bytes with the decode kernel: one prefill, then O(1) per token.
 
-    Three things that matter here:
-
-    1. **Prefill once** to build the per layer state, then step. O(n), not O(n^2).
-    2. **jit the step.** Un-jitted, every call re-traces and recompiles all the Pallas
-       kernels in the stack, so it never finishes.
-    3. **Donate the state**, like a generation loop should.
-
-    Sampling is temperature + top-p + a repetition penalty over the last `rep_window`
-    bytes. See `_pick_token`.
+    The byte-level wrapper over `generate`: encode the prompt as raw bytes, decode the
+    result back. Use `generate` directly for a real tokenizer's ids.
 
     `stream` prints bytes as they arrive. At ~270 us per token that is legible in real
-    time, and a silent generator looks hung.
+    time, and a silent generator looks hung. Bytes are printed individually with
+    ``errors="replace"``, so a multi-byte UTF-8 sequence shows as replacement characters
+    while streaming even though the returned value decodes cleanly.
     """
-    pad_to = cfg.siso.chunk
-    ctx = np.frombuffer(prompt, dtype=np.uint8)
-    if len(ctx) < pad_to:
-        ctx = np.concatenate([np.zeros(pad_to - len(ctx), np.uint8), ctx])
-    ctx = ctx[-pad_to:]
-
-    prefill = jax.jit(
-        functools.partial(M.lm_forward, cfg=cfg, interpret=interpret)
-    )
-    step = jax.jit(
-        functools.partial(M.lm_decode_step, cfg=cfg, interpret=interpret)
-    )
-
-    logits, states = prefill(
-        params, jnp.asarray(ctx[None], jnp.int32), states=M.zero_states(cfg, 1)
-    )
-    last = logits[0, -1]
-
-    out = bytearray(prompt)
+    emit = None
     if stream:
         print(prompt.decode("utf-8", errors="replace"), end="", flush=True)
-    filt = jnp.asarray([temperature, top_p, rep_penalty], jnp.float32)
-    # Fixed-size mask, updated on the host as a ring buffer. A variable-length index
-    # array would re-trace `_pick_token` on every distinct window size.
-    seen = np.zeros(cfg.vocab_size, bool)
-    window: list[int] = list(prompt[-rep_window:])
-    for b in window:
-        seen[b] = True
-    for _ in range(n_tokens):
-        key, sub = jax.random.split(key)
-        nxt = int(_pick_token(last, jnp.asarray(seen), sub, filt, cfg.vocab_size))
-        out.append(nxt)
-        window.append(nxt)
-        if len(window) > rep_window:
-            dropped = window.pop(0)
-            if dropped not in window:
-                seen[dropped] = False
-        seen[nxt] = True
-        if stream:
-            print(
-                bytes([nxt]).decode("utf-8", errors="replace"), end="", flush=True
-            )
-        logits, states = step(params, jnp.asarray([nxt], jnp.int32), states)
-        last = logits[0]
+
+        def emit(t: int) -> None:
+            print(bytes([t]).decode("utf-8", errors="replace"), end="", flush=True)
+
+    ids = generate(
+        params, cfg, key,
+        prompt_ids=np.frombuffer(prompt, dtype=np.uint8),
+        n_tokens=n_tokens, temperature=temperature, top_p=top_p,
+        rep_penalty=rep_penalty, rep_window=rep_window, interpret=interpret,
+        on_token=emit,
+    )
     if stream:
         print(flush=True)
-    return bytes(out)
+    return bytes(ids)
 
 
 def main(argv: list[str] | None = None) -> int:
