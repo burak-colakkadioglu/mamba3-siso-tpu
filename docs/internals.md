@@ -217,6 +217,33 @@ because `pallas_call` builds its outputs from `ShapeDtypeStruct`s that carry no
 `in_specs` declares, so params and optimizer state get placed replicated once and each batch
 gets placed sharded on the way in.
 
+## Training memory
+
+Data parallel replicates params and optimizer state on every chip, so per-chip memory is
+set by the model, not the batch. The training step donates params and optimizer state
+(`donate_argnums=(0, 1)`), and at scale that is the difference between fitting and not.
+
+Undonated, a step holds six param-sized buffers at once: params, grads, Adam's two moments,
+the updates, and the new params. XLA can't write the new params over the old ones unless you
+tell it the old ones are dead. At 787M f32 that is 2.93 GiB each:
+
+```
+6 x 2.93 = 17.6 GiB   against a v5e's 15.75, OOM
+4 x 2.93 = 11.7 GiB   donated, ~4 GiB left for activations
+```
+
+Two things follow. Donation deletes the buffers you pass in, so the loop has to thread
+params and `opt_state` through the return value, and a "best so far" snapshot has to be a
+real copy: `jax.tree.map(lambda t: t, params)` rebuilds the tree around the *same* buffers
+and dangles on the next step. `train.py` copies that snapshot to host numpy, which also
+keeps it out of HBM.
+
+Also worth knowing: this floor is independent of `seqlen`. The model is recurrent, activation
+memory per step doesn't grow with sequence length the way attention's does, so shortening
+the sequence does not help an OOM that is really about parameter copies. Optimizer state is
+the next thing to attack (sharding Adam's moments across chips would save ~5 GiB at 787M);
+that isn't implemented.
+
 ## Numerics
 
 Tolerances follow upstream's own metric: 95th percentile relative error over entries with

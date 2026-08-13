@@ -311,6 +311,19 @@ def make_step(cfg: M.LMConfig, opt, interpret: Any, mesh=None):
     Gradients are averaged across the mesh with ``jax.lax.pmean`` inside the shard_map, so
     every replica applies the same update and the params stay in step without an explicit
     all-gather.
+
+    **Params and optimizer state are donated.** Without donation XLA has to allocate the
+    new params and the new optimizer state while the old ones are still live, so a step
+    holds six param-sized buffers at once: params, grads, Adam's two moments, the updates,
+    and the new params. At 787M f32 that is 2.93 GiB each, 17.6 GiB, which does not fit in
+    a v5e's 15.75 GiB no matter how small the batch or how short the sequence (the
+    temporaries here are independent of both). Donating lets XLA alias the outputs onto the
+    inputs and reuse dead intermediates, which removes three of those copies.
+
+    Donation deletes the buffers passed in, so the caller has to thread params and
+    opt_state through the return value and must not hold a second reference to either. In
+    particular a "best so far" snapshot has to be a real copy, not an identity
+    ``tree.map``, which only rebuilds the tree around the same buffers.
     """
     import optax
 
@@ -319,7 +332,7 @@ def make_step(cfg: M.LMConfig, opt, interpret: Any, mesh=None):
         return optax.softmax_cross_entropy_with_integer_labels(logits, ys).mean()
 
     if mesh is None:
-        @jax.jit
+        @functools.partial(jax.jit, donate_argnums=(0, 1))
         def step(params, opt_state, xs, ys):
             loss, grads = jax.value_and_grad(loss_fn)(params, xs, ys)
             updates, opt_state = opt.update(grads, opt_state, params)
@@ -345,7 +358,7 @@ def make_step(cfg: M.LMConfig, opt, interpret: Any, mesh=None):
         check_vma=False,
     )
 
-    @jax.jit
+    @functools.partial(jax.jit, donate_argnums=(0, 1))
     def step(params, opt_state, xs, ys):
         loss, grads = grad_fn(params, xs, ys)
         updates, opt_state = opt.update(grads, opt_state, params)
@@ -756,7 +769,12 @@ def main(argv: list[str] | None = None) -> int:
     val_hist: list[tuple[int, float]] = []
     # Keep the best-validation params. Held-out loss on a small corpus turns around well
     # before the schedule ends, so reporting the final params understates the model by
-    # however far past its optimum the run went. Costs one params-sized copy.
+    # however far past its optimum the run went.
+    #
+    # Copied to the host, not kept on device. `step` donates params, so the device buffers
+    # this snapshot came from get deleted on the next step: a `jax.tree.map(lambda t: t,
+    # params)` would rebuild the tree around those same dead buffers. Host numpy also keeps
+    # the snapshot out of HBM, which matters at scale since it is a full params-sized copy.
     best: tuple[float, int, Any] | None = None
     for i in range(1, args.steps + 1):
         xs, ys = next(stream)
@@ -773,7 +791,7 @@ def main(argv: list[str] | None = None) -> int:
                 val_hist.append((i, v))
                 mark = " "
                 if best is None or v < best[0]:
-                    best = (v, i, jax.tree.map(lambda t: t, params))
+                    best = (v, i, jax.tree.map(np.asarray, params))
                     mark = "*"
                 vcol = f"{v / math.log(2):8.3f}{mark}"
             el = time.perf_counter() - t0
@@ -788,7 +806,9 @@ def main(argv: list[str] | None = None) -> int:
     val_final = val_hist[-1][1] if val_hist else evaluate(params)
     tokens_seen = global_batch * args.seqlen * args.steps
     if best is not None and best[1] < args.steps:
-        params = best[2]                      # generate from the best checkpoint
+        # Back to device from the host snapshot. Unsharded on purpose: everything after
+        # this point (save, sampling) is single-device.
+        params = jax.tree.map(jnp.asarray, best[2])
     val = best[0] if best is not None else val_final
 
     print(f"\ntrain loss {final:.4f} nats ({final / math.log(2):.3f} bits/byte)"
