@@ -1,7 +1,5 @@
 # mamba3-siso-tpu
 
-[![tests](https://github.com/burak-colakkadioglu/mamba3-siso-tpu/actions/workflows/tests.yml/badge.svg)](https://github.com/burak-colakkadioglu/mamba3-siso-tpu/actions/workflows/tests.yml)
-
 Mamba-3 SISO as JAX/Pallas TPU kernels. Forward, backward, single token decode.
 
 SISO only, the `ngroups=1` variant where every head gets its own B/C. MIMO is not
@@ -65,9 +63,10 @@ One v5e chip, B=8 H=32 L=8192 N=128 P=64, bf16:
 | training on 8 chips | **~495K tok/s** at 30.8M params |
 | decode, B=256 | 1.4 ms/token |
 
-Every number here was measured by hand on a v5e-8. CI can't check throughput, so if you
-change the kernels, re-measure. The forward is compute bound at these shapes and the decode
-is bandwidth bound, which is why the two are reported differently.
+Every number here was measured by hand on a v5e-8. Nothing measures throughput
+automatically, so if you change the kernels, re-measure. The forward is compute bound at
+these shapes and the decode is bandwidth bound, which is why the two are reported
+differently.
 
 ## Install
 
@@ -125,7 +124,17 @@ python -m mamba3_pallas.tests          # CPU, interpret mode
 python -m mamba3_pallas.tests --tpu    # real shapes, needs a TPU
 ```
 
-All pass on a v5e-8. Most of it runs in CI on free CPU runners:
+All pass on a v5e-8. Almost all of it also passes with no TPU at all, 91 checks: `lower` 40,
+`shapes` 8, `refs` 4, `rotation` 4, `forward` 13, `backward` 13, `segments` 6, `torch` 3.
+That is every stage except `decode` and `train`, which are too slow in interpret mode to sit
+in a quick run. Run them yourself:
+
+```bash
+python -m mamba3_pallas.tests --stage lower --stage shapes --stage refs --stage rotation \
+    --stage forward --stage backward --stage segments --stage torch
+```
+
+Two things make that possible on a machine with no TPU:
 
 - **40 Mosaic lowering configs.** `--stage lower` runs the real Mosaic lowering under an
   abstract TPU mesh. chunk 128/256/512/1024, bf16/f32, v5e and v3. Block shape bugs and
@@ -133,7 +142,8 @@ All pass on a v5e-8. Most of it runs in CI on free CPU runners:
 - **All the numerical stages** in interpret mode. Slow but correct, so parity vs the
   references and vs PyTorch is checked too.
 
-CI can't check speed, only correctness.
+No hosted CI here, so no badge, run the command instead. Nothing checks throughput either
+way, only correctness.
 
 ## Train
 
