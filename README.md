@@ -208,6 +208,21 @@ docs/internals.md  design decisions and constraints
 - Variable length / packed sequences are not implemented either. Segmented prefill works
   (chain the carry), packing many short sequences into one row does not.
 
+## A note on AI use
+
+I want to be upfront about this, since it's a fair thing to wonder about. I used AI to help
+write the documentation and the inline comments in this repo. The code itself, the kernels,
+the layout machinery, the tests and the training loop, is written by me.
+
+The honest reason is that I'm not very good at explaining things to people who haven't been
+looking at the same code I have. I understand what I write, but when I try to describe it, it
+comes out either too terse or too tangled to be useful to anyone else. It's something I'm
+working on, and I'd like to be writing all of this myself eventually.
+
+I read over everything before it goes in, but I'm sure some of it still slips past me. If a
+comment or a section here doesn't match the behaviour you see, I'd genuinely appreciate you
+telling me, and I'm sorry for the time it costs you to work it out.
+
 ## Citation
 
 The layer is from the Mamba-3 paper:
