@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mamba3-siso-tpu"
+version = "0.1.0"
+description = "Mamba-3 SISO as JAX/Pallas TPU kernels: forward, backward and decode"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "Apache-2.0"
+license-files = ["LICENSE", "NOTICE"]
+authors = [{ name = "Burak Colakkadioglu" }]
+keywords = ["mamba", "mamba3", "siso", "state-space-model", "tpu", "pallas", "jax", "kernels"]
+
+dependencies = ["jax>=0.6", "numpy>=1.24"]
+
+[project.optional-dependencies]
+tpu = ["jax[tpu]>=0.6"]
+torch = ["torch>=2.0"]
+train = ["optax>=0.2"]
+flax = ["flax>=0.10"]
+dev = ["torch>=2.0", "optax>=0.2", "flax>=0.10", "ruff>=0.6"]
+
+[project.urls]
+Homepage = "https://github.com/burak-colakkadioglu/mamba3-siso-tpu"
+Issues = "https://github.com/burak-colakkadioglu/mamba3-siso-tpu/issues"
+
+[tool.setuptools]
+packages = ["mamba3_pallas"]
+
+[tool.ruff]
+line-length = 90
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B"]
+ignore = ["E741"]

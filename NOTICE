@@ -1,0 +1,51 @@
+mamba3-siso-tpu
+Copyright 2026 Burak Colakkadioglu
+
+This product includes software derived from Mamba
+(https://github.com/state-spaces/mamba), licensed under the Apache License,
+Version 2.0. Upstream's project level notice reads "Copyright 2023 Tri Dao,
+Albert Gu". The specific Mamba-3 files this work derives from carry their own
+later headers, reproduced with each entry below.
+
+Files derived from that work, and what changed:
+
+  mamba3_pallas/torch_ref.py
+      Copyright (c) 2026, Dao AI Lab, Goombalab
+          (mamba_ssm/modules/mamba3.py, the Mamba3 module)
+      Copyright (c) 2025, Dao AI Lab, Goombalab
+          (tests/ops/triton/test_mamba3_siso.py, mamba3_siso_step_ref)
+
+      Transcribed from those two files. Vendored instead of imported because
+      mamba_ssm needs triton, tilelang and CUDA at import time, none of which
+      exist on a TPU host. MIMO and varlen paths were removed. Upstream's two
+      statement `A` clamp is kept as two statements on purpose, since folding
+      it into one would reassociate the negation and flip the sign.
+
+  mamba3_pallas/convert.py
+      Copyright (c) 2026, Dao AI Lab, Goombalab
+          (in_proj layout and state_dict key names from
+           mamba_ssm/modules/mamba3.py)
+
+      Depends on upstream's in_proj layout and state_dict key names so real
+      checkpoints load. Adds the interleaved -> half-split rotary permutation,
+      which upstream does not need.
+
+  mamba3_pallas/reference.py
+      Copyright (c) 2025, Dao AI Lab, Goombalab
+          (recurrence structure from
+           mamba_ssm/ops/triton/mamba3/mamba3_siso_fwd.py and
+           mamba3_siso_combined.py)
+
+      The recurrence equations follow the Mamba-3 paper and upstream's Triton
+      kernel. The chunked form and the collapsed single-term scan are written
+      from scratch here.
+
+Everything else in mamba3_pallas/ is original work: the Pallas TPU kernels
+(forward, backward, decode), the layout/BlockSpec machinery, the test suite
+and the training code.
+
+The algorithm is from:
+
+  Mamba-3: Improved Sequence Modeling using State Space Principles.
+  Aakash Lahoti, Kevin Y. Li, Berlin Chen, Caitlin Wang, Aviv Bick,
+  J. Zico Kolter, Tri Dao, Albert Gu. 2026. arXiv:2603.15569
