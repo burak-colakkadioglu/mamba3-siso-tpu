@@ -142,9 +142,9 @@ python -m mamba3_pallas.tests          # CPU, interpret mode
 python -m mamba3_pallas.tests --tpu    # real shapes, needs a TPU
 ```
 
-All pass on a v5e-8. Almost all of it also passes with no TPU at all, 112 checks: `lower` 40,
+All pass on a v5e-8. Almost all of it also passes with no TPU at all, 114 checks: `lower` 40,
 `shapes` 8, `refs` 4, `rotation` 4, `forward` 13, `backward` 13, `segments` 6, `torch` 3,
-`checkpoint` 14, `pretrained` 7. That is every stage except `decode` and `train`, which are
+`checkpoint` 14, `pretrained` 9. That is every stage except `decode` and `train`, which are
 too slow in interpret mode to sit in a quick run. Run them yourself:
 
 ```bash

@@ -36,9 +36,18 @@ from . import layout as L
 
 
 def _to_numpy(x: Any) -> np.ndarray:
-    """Accept a torch tensor, numpy array, or anything with ``__array__``."""
+    """Accept a torch tensor, numpy array, or anything with ``__array__``.
+
+    Torch tensors go through ``.float()`` before numpy sees them. numpy has no native
+    bfloat16, so ``np.asarray(bf16_tensor, dtype=np.float32)`` raises
+    ``TypeError: Got unsupported ScalarType BFloat16`` rather than converting, and the
+    released Mamba-3 checkpoints are stored bf16. Widening on the torch side first works
+    for bf16, fp16 and f32 alike.
+    """
     if hasattr(x, "detach"):
         x = x.detach().cpu()
+        if hasattr(x, "float"):
+            x = x.float()
     return np.asarray(x, dtype=np.float32)
 
 

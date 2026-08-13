@@ -1145,6 +1145,32 @@ def stage_pretrained(env: Env, rep: Report) -> None:
             raised = 1.0
         rep.check("pretrained", f"rejects {why}", 1.0 - raised, 1e-12)
 
+    # The released files are stored bfloat16, which numpy has no dtype for: converting a
+    # bf16 tensor straight to numpy raises rather than widening. Load the same weights as
+    # torch bf16 tensors and check the loader widens them itself.
+    #
+    # The comparison is against the f32 weights *put through bf16 rounding*, not against
+    # `ref`. Rounding 3 layers of weights to 8 mantissa bits moves the logits by ~2e-01
+    # on its own, so checking bf16-loaded output against an f32 reference would be
+    # measuring bf16, not the loader.
+    bf16_sd = {k: torch.from_numpy(v).to(torch.bfloat16) for k, v in sd.items()}
+    bf16_params = CV.load_lm_state_dict(bf16_sd, cfg)
+    rounded_sd = {k: v.float().numpy() for k, v in bf16_sd.items()}
+    rounded_params = CV.load_lm_state_dict(rounded_sd, cfg)
+    worst = max(
+        float(np.max(np.abs(np.asarray(a) - np.asarray(b))))
+        for a, b in zip(jax.tree.leaves(bf16_params), jax.tree.leaves(rounded_params))
+    )
+    rep.check("pretrained", "bf16 state dict loads exactly", worst, 0.0)
+
+    got_bf16 = M.lm_forward(bf16_params, jnp.asarray(tokens), cfg, interpret=env.interpret)
+    rep.check(
+        "pretrained", "bf16 weights stay finite",
+        0.0 if bool(jnp.isfinite(got_bf16).all()) else 1.0, 1e-12,
+    )
+
+
+
 
 
 
