@@ -42,6 +42,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
+from . import checkpoint as CP
 from . import layer as LY
 from . import layout as L
 from . import model as M
@@ -522,6 +523,20 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--rep-penalty", type=float, default=1.15,
                     help="1.0 disables; enwik8 entity runs need ~1.1-1.2")
     ap.add_argument("--sample-bytes", type=int, default=384)
+    ap.add_argument(
+        "--save", default=None, metavar="PATH",
+        help="write the best-validation weights to PATH as an npz (see "
+             "checkpoint.py). Without this the weights are discarded when the run ends.",
+    )
+    ap.add_argument(
+        "--save-dtype", default="float32", choices=("float32", "bfloat16"),
+        help="dtype to store weights in; bfloat16 halves the file",
+    )
+    ap.add_argument(
+        "--resume", default=None, metavar="PATH",
+        help="start from the weights in PATH instead of a fresh init. The model shape "
+             "comes from the checkpoint, so the --d-model/--n-layers flags are ignored.",
+    )
     args = ap.parse_args(argv)
 
     try:
@@ -540,11 +555,20 @@ def main(argv: list[str] | None = None) -> int:
         None if args.corpus == "synthetic" else args.corpus, args.corpus_bytes
     )
     data, val_data = split_corpus(raw, protocol=args.protocol_split)
-    siso = LY.SISOConfig(
-        d_model=args.d_model, d_state=args.d_state, headdim=args.headdim,
-        chunk=args.chunk, policy_name=args.policy,
-    )
-    cfg = M.LMConfig(vocab_size=256, n_layers=args.n_layers, siso=siso)
+    resumed = None
+    if args.resume:
+        # The checkpoint owns the model shape: rebuilding it from the flags would silently
+        # produce a different tree if they disagree, and the load would fail on shapes.
+        resumed, cfg = CP.load(args.resume, dtype=jnp.float32)
+        siso = cfg.siso
+        print(f"resuming from {args.resume}: {cfg.n_layers} layers,"
+              f" d_model={siso.d_model}, {cfg.param_count() / 1e6:.2f}M params")
+    else:
+        siso = LY.SISOConfig(
+            d_model=args.d_model, d_state=args.d_state, headdim=args.headdim,
+            chunk=args.chunk, policy_name=args.policy,
+        )
+        cfg = M.LMConfig(vocab_size=256, n_layers=args.n_layers, siso=siso)
 
     # Data parallelism over chips. `--batch` is per device so the global batch grows with
     # the mesh, which keeps a given --batch comparable across device counts and makes the
@@ -571,8 +595,8 @@ def main(argv: list[str] | None = None) -> int:
     print(L.describe_environment())
     print(f"data: {label}, {len(data) / 1e6:.1f}M bytes train"
           f" + {len(val_data) / 1e6:.1f}M held-out ({split_desc})")
-    print(f"model: {args.n_layers} x SISO(d_model={args.d_model}, d_state={args.d_state},"
-          f" P={args.headdim}, H={siso.nheads}), {cfg.param_count() / 1e6:.2f}M params")
+    print(f"model: {cfg.n_layers} x SISO(d_model={siso.d_model}, d_state={siso.d_state},"
+          f" P={siso.headdim}, H={siso.nheads}), {cfg.param_count() / 1e6:.2f}M params")
     if mesh:
         print(f"shard: {n_dev} chips via shard_map, batch {args.batch}/chip"
               f" = {global_batch} global (Mosaic cannot be auto-partitioned)")
@@ -603,7 +627,7 @@ def main(argv: list[str] | None = None) -> int:
     print("  Transformer-XL 41M 1.06 | 277M 0.99 | +dyn.eval 277M 0.94")
     print("Held-out loss is what counts; train loss falls by memorizing.\n")
 
-    params = M.init_lm(cfg, jax.random.key(args.seed))
+    params = M.init_lm(cfg, jax.random.key(args.seed)) if resumed is None else resumed
     sched = optax.warmup_cosine_decay_schedule(
         init_value=args.lr * 0.1, peak_value=args.lr, warmup_steps=args.warmup,
         decay_steps=max(args.steps, args.warmup + 1), end_value=args.lr * 0.1,
@@ -745,6 +769,15 @@ def main(argv: list[str] | None = None) -> int:
         elif epochs < 1.5 and gap > -0.1 and best is not None and best[1] >= args.steps:
             print(f"  -> still improving at the final step and only {epochs:.2f} epochs in;"
                   f" more steps will help.")
+
+    # Save before sampling. Sampling is the part most likely to raise (an unlucky prompt,
+    # a decode-path bug), and losing an hour of TPU time to that would be avoidable.
+    if args.save:
+        written = CP.save(args.save, params, cfg, dtype=getattr(jnp, args.save_dtype))
+        mb = os.path.getsize(written) / (1 << 20)
+        print(f"\nsaved {written} ({mb:.1f} MiB, {args.save_dtype},"
+              f" val {val / math.log(2):.3f} bpb)")
+        print(f"  reload it with: mamba3_pallas.checkpoint.load({written!r})")
 
     key = jax.random.key(args.seed + 2)
     prompt = b"the " if args.corpus == "synthetic" else b"[[The "

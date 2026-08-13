@@ -14,6 +14,7 @@ ordered cheapest-first, so a break shows up in the fastest thing that can see it
   6 decode     both decode grids vs the step reference, chain vs prefill, and the
                prefill-then-decode handoff.
   7 torch      PyTorch reference on CPU vs JAX through convert.py.
+  7b checkpoint save/load round-trip: same config, same tree, same logits.
   8 train      overfit a tiny LM task; also the paper's parity task.
 
 Usage::
@@ -925,6 +926,96 @@ def stage_torch(env: Env, rep: Report) -> None:
 
 
 # --------------------------------------------------------------------------------------
+# Stage 7b: checkpoint round-trip
+# --------------------------------------------------------------------------------------
+
+
+def stage_checkpoint(env: Env, rep: Report) -> None:
+    """`checkpoint.save` then `checkpoint.load` must return the same model.
+
+    Cheap and pure host code, no kernel involved, but worth asserting: a checkpoint that
+    silently drops a leaf or reassociates the ``blocks`` list would produce a model that
+    loads fine and generates garbage. Checks the tie_head and untied trees separately
+    since they differ by one array, and checks that bf16 storage halves the file and
+    survives a widening load.
+    """
+    import os
+    import tempfile
+
+    from . import checkpoint as CP
+    from . import model as M
+
+    siso = LY.SISOConfig(
+        d_model=128, d_state=128, headdim=64, chunk=env.chunk, policy_name="f32"
+    )
+    with tempfile.TemporaryDirectory() as d:
+        for tie in (True, False):
+            cfg = M.LMConfig(vocab_size=256, n_layers=2, siso=siso, tie_head=tie)
+            params = M.init_lm(cfg, jax.random.key(3))
+            path = CP.save(os.path.join(d, f"t{tie}.npz"), params, cfg)
+            got, got_cfg = CP.load(path)
+            tag = "tied" if tie else "untied"
+            rep.check(
+                "checkpoint", f"{tag}: config round-trip",
+                0.0 if got_cfg == cfg else 1.0, 1e-12,
+            )
+            rep.check(
+                "checkpoint", f"{tag}: tree structure",
+                0.0 if jax.tree.structure(got) == jax.tree.structure(params) else 1.0,
+                1e-12,
+            )
+            worst = max(
+                float(np.max(np.abs(np.asarray(a) - np.asarray(b))))
+                for a, b in zip(jax.tree.leaves(params), jax.tree.leaves(got))
+            )
+            rep.check("checkpoint", f"{tag}: weights bit-exact", worst, 0.0)
+
+        # Same logits out of the loaded model as the saved one. This is the property that
+        # actually matters and it catches a permuted-but-complete tree, which the
+        # per-leaf check above would pass.
+        cfg = M.LMConfig(vocab_size=256, n_layers=2, siso=siso, tie_head=True)
+        params = M.init_lm(cfg, jax.random.key(4))
+        path = CP.save(os.path.join(d, "logits.npz"), params, cfg)
+        got, got_cfg = CP.load(path)
+        tokens = jnp.asarray(
+            np.random.default_rng(0).integers(0, 256, (1, env.chunk)), jnp.int32
+        )
+        a = M.lm_forward(params, tokens, cfg, interpret=env.interpret)
+        b = M.lm_forward(got, tokens, got_cfg, interpret=env.interpret)
+        rep.check("checkpoint", "identical logits after reload", max_rel(b, a), 0.0)
+
+        # bfloat16 storage: half the bytes, and a widening load must give back a usable
+        # float32 tree rather than the opaque void dtype npz stores bf16 as.
+        f32 = CP.save(os.path.join(d, "f32.npz"), params, cfg)
+        bf16 = CP.save(os.path.join(d, "bf16.npz"), params, cfg, dtype=jnp.bfloat16)
+        ratio = os.path.getsize(bf16) / os.path.getsize(f32)
+        rep.check("checkpoint", "bf16 file is half of f32", abs(ratio - 0.5), 0.02)
+        wide, _ = CP.load(bf16, dtype=jnp.float32)
+        rep.check(
+            "checkpoint", "bf16 load widens to f32",
+            0.0 if np.asarray(wide.embed).dtype == np.float32 else 1.0, 1e-12,
+        )
+        rep.check(
+            "checkpoint", "bf16 weights within bf16 epsilon",
+            max_rel(wide.embed, params.embed), 1e-2,
+        )
+
+        # A corrupt file must raise, not load a wrong model.
+        with np.load(f32, allow_pickle=False) as z:
+            entries = {k: z[k] for k in z.files}
+        del entries["blocks.1.in_proj"]
+        broken = os.path.join(d, "broken.npz")
+        np.savez(broken, **entries)
+        raised = 0.0
+        try:
+            CP.load(broken)
+        except ValueError:
+            raised = 1.0
+        rep.check("checkpoint", "missing array raises", 1.0 - raised, 1e-12)
+
+
+
+# --------------------------------------------------------------------------------------
 # Stage 8: training behaviour
 # --------------------------------------------------------------------------------------
 
@@ -1050,6 +1141,7 @@ STAGES: dict[str, Callable[[Env, Report], None]] = {
     "segments": stage_segments,
     "decode": stage_decode,
     "torch": stage_torch,
+    "checkpoint": stage_checkpoint,
     "train": stage_train,
 }
 

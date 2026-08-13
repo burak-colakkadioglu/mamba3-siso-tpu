@@ -27,6 +27,7 @@ Modules:
   layer          SISOConfig/SISOParams, the functional layer, optional Flax NNX module.
   model          A stacked pre-norm LM around ``n_layers`` SISO blocks.
   convert        torch state_dict -> SISOParams (applies the permutation).
+  checkpoint     Save/load trained weights as a self-describing npz.
   torch_ref      Vendored PyTorch reference, CPU-only.
   tests          Staged correctness suite.
   train          Byte-level LM training.
@@ -36,6 +37,7 @@ dependencies (torch, optax) and are meant to be run as ``python -m``.
 """
 
 from . import (
+    checkpoint,
     convert,
     kernel_bwd,
     kernel_decode,
@@ -57,4 +59,5 @@ __all__ = [
     "layer",
     "model",
     "convert",
+    "checkpoint",
 ]

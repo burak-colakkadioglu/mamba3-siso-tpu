@@ -124,14 +124,14 @@ python -m mamba3_pallas.tests          # CPU, interpret mode
 python -m mamba3_pallas.tests --tpu    # real shapes, needs a TPU
 ```
 
-All pass on a v5e-8. Almost all of it also passes with no TPU at all, 91 checks: `lower` 40,
-`shapes` 8, `refs` 4, `rotation` 4, `forward` 13, `backward` 13, `segments` 6, `torch` 3.
-That is every stage except `decode` and `train`, which are too slow in interpret mode to sit
-in a quick run. Run them yourself:
+All pass on a v5e-8. Almost all of it also passes with no TPU at all, 102 checks: `lower` 40,
+`shapes` 8, `refs` 4, `rotation` 4, `forward` 13, `backward` 13, `segments` 6, `torch` 3,
+`checkpoint` 11. That is every stage except `decode` and `train`, which are too slow in
+interpret mode to sit in a quick run. Run them yourself:
 
 ```bash
 python -m mamba3_pallas.tests --stage lower --stage shapes --stage refs --stage rotation \
-    --stage forward --stage backward --stage segments --stage torch
+    --stage forward --stage backward --stage segments --stage torch --stage checkpoint
 ```
 
 Two things make that possible on a machine with no TPU:
@@ -149,13 +149,27 @@ way, only correctness.
 
 ```bash
 python -m mamba3_pallas.train --steps 18000 --d-model 768 --n-layers 8 --batch 8 \
-    --corpus enwik8 --protocol-split
+    --corpus enwik8 --protocol-split --save enwik8-31m.npz
 ```
 
 Downloads and caches the corpus, shards the batch over every chip, keeps the best
 validation checkpoint, and tells you if your config is actually comparable to published
 numbers. `--corpus` also takes `enwik9`, `text8`, `tiny_shakespeare`, `synthetic`, or a
 path (Kaggle `/kaggle/input/...` mounts work).
+
+`--save` writes the best-validation weights, without it they are gone when the run ends.
+`--save-dtype bfloat16` halves the file. `--resume path.npz` picks a run back up, and the
+model shape comes from the file so you don't have to repeat the `--d-model`/`--n-layers`
+flags.
+
+Weights are a plain npz, no pickle, with the config stored alongside them:
+
+```python
+from mamba3_pallas import checkpoint as CP, model as M
+
+params, cfg = CP.load("enwik8-31m.npz")
+logits = M.lm_forward(params, tokens, cfg)      # tokens: (B, L) int32, raw bytes
+```
 
 ## Files
 
@@ -170,8 +184,9 @@ mamba3_pallas/
   layer.py         config, params, the layer, optional Flax NNX module
   model.py         stacked LM
   convert.py       torch state_dict -> params
+  checkpoint.py    save/load trained weights as npz
   torch_ref.py     vendored PyTorch reference, CPU only
-  tests.py         10 test stages
+  tests.py         11 test stages
   train.py         byte level LM training
 docs/internals.md  design decisions and constraints
 ```
