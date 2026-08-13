@@ -490,6 +490,11 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--n-layers", type=int, default=4)
     ap.add_argument("--headdim", type=int, default=64)
     ap.add_argument("--d-state", type=int, default=128)
+    ap.add_argument(
+        "--d-intermediate", type=int, default=0,
+        help="hidden width of a per-block gated MLP; 0 means no MLP. The released "
+             "Mamba-3 checkpoints use 2*d_model, byte level models here do fine without.",
+    )
     ap.add_argument("--lr", type=float, default=1e-3)
     ap.add_argument("--warmup", type=int, default=100)
     ap.add_argument("--policy", default="bf16")
@@ -575,7 +580,10 @@ def main(argv: list[str] | None = None) -> int:
             d_model=args.d_model, d_state=args.d_state, headdim=args.headdim,
             chunk=args.chunk, policy_name=args.policy,
         )
-        cfg = M.LMConfig(vocab_size=256, n_layers=args.n_layers, siso=siso)
+        cfg = M.LMConfig(
+            vocab_size=256, n_layers=args.n_layers, siso=siso,
+            d_intermediate=args.d_intermediate,
+        )
 
     # Data parallelism over chips. `--batch` is per device so the global batch grows with
     # the mesh, which keeps a given --batch comparable across device counts and makes the
@@ -603,7 +611,9 @@ def main(argv: list[str] | None = None) -> int:
     print(f"data: {label}, {len(data) / 1e6:.1f}M bytes train"
           f" + {len(val_data) / 1e6:.1f}M held-out ({split_desc})")
     print(f"model: {cfg.n_layers} x SISO(d_model={siso.d_model}, d_state={siso.d_state},"
-          f" P={siso.headdim}, H={siso.nheads}), {cfg.param_count() / 1e6:.2f}M params")
+          f" P={siso.headdim}, H={siso.nheads})"
+          f"{f' + MLP({cfg.d_intermediate})' if cfg.d_intermediate else ''},"
+          f" {cfg.param_count() / 1e6:.2f}M params")
     if mesh:
         print(f"shard: {n_dev} chips via shard_map, batch {args.batch}/chip"
               f" = {global_batch} global (Mosaic cannot be auto-partitioned)")

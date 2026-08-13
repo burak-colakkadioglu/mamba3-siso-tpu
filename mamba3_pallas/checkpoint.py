@@ -44,13 +44,15 @@ CONFIG_KEY = "__config__"
 def _flat_key(keypath: tuple[Any, ...]) -> str:
     """A readable, stable name for one leaf of an `model.LMParams` tree.
 
-    ``jax.tree_util.keystr`` gives ``.blocks[0][1].in_proj``, which is accurate but ugly
-    in a file listing and mixes three separators. This maps the two positional indices
-    that `LMParams.blocks` uses onto names:
+    ``jax.tree_util.keystr`` gives ``.blocks[0].siso.in_proj``, which is accurate but
+    mixes three separators and starts with a dot. This flattens it:
 
-        .blocks[0][0]           -> blocks.0.norm_gain
-        .blocks[0][1].in_proj   -> blocks.0.in_proj
-        .embed                  -> embed
+        .blocks[0].norm_gain       -> blocks.0.norm_gain
+        .blocks[0].siso.in_proj    -> blocks.0.siso.in_proj
+        .embed                     -> embed
+
+    `model.BlockParams` uses named fields, so nothing has to be mapped by position. That
+    was not true of the ``(norm_gain, SISOParams)`` tuple it replaced.
     """
     parts: list[str] = []
     for k in keypath:
@@ -60,14 +62,6 @@ def _flat_key(keypath: tuple[Any, ...]) -> str:
             parts.append(str(k.idx))
         else:                                   # pragma: no cover - defensive
             parts.append(str(k).strip(".[]'\""))
-    # blocks is a list of (norm_gain, SISOParams) pairs: name the tuple slots.
-    if len(parts) >= 3 and parts[0] == "blocks":
-        slot = parts[2]
-        rest = parts[3:]
-        if slot == "0":
-            return f"blocks.{parts[1]}.norm_gain"
-        if slot == "1" and rest:
-            return f"blocks.{parts[1]}." + ".".join(rest)
     return ".".join(parts)
 
 
@@ -79,6 +73,7 @@ def config_to_dict(cfg: M.LMConfig) -> dict[str, Any]:
         "vocab_size": cfg.vocab_size,
         "n_layers": cfg.n_layers,
         "tie_head": cfg.tie_head,
+        "d_intermediate": cfg.d_intermediate,
         "siso": {
             "d_model": c.d_model,
             "d_state": c.d_state,
@@ -116,6 +111,7 @@ def config_from_dict(d: dict[str, Any]) -> M.LMConfig:
         n_layers=int(d["n_layers"]),
         siso=LY.SISOConfig(**siso_kw),
         tie_head=bool(d["tie_head"]),
+        d_intermediate=int(d.get("d_intermediate", 0)),
     )
 
 

@@ -15,6 +15,7 @@ ordered cheapest-first, so a break shows up in the fastest thing that can see it
                prefill-then-decode handoff.
   7 torch      PyTorch reference on CPU vs JAX through convert.py.
   7b checkpoint save/load round-trip: same config, same tree, same logits.
+  7c pretrained released-checkpoint key mapping and gated MLP, vs a torch stack.
   8 train      overfit a tiny LM task; also the paper's parity task.
 
 Usage::
@@ -949,12 +950,15 @@ def stage_checkpoint(env: Env, rep: Report) -> None:
         d_model=128, d_state=128, headdim=64, chunk=env.chunk, policy_name="f32"
     )
     with tempfile.TemporaryDirectory() as d:
-        for tie in (True, False):
-            cfg = M.LMConfig(vocab_size=256, n_layers=2, siso=siso, tie_head=tie)
+        for tie, d_int in ((True, 0), (False, 0), (True, 64)):
+            cfg = M.LMConfig(
+                vocab_size=256, n_layers=2, siso=siso, tie_head=tie,
+                d_intermediate=d_int,
+            )
             params = M.init_lm(cfg, jax.random.key(3))
-            path = CP.save(os.path.join(d, f"t{tie}.npz"), params, cfg)
+            path = CP.save(os.path.join(d, f"t{tie}{d_int}.npz"), params, cfg)
             got, got_cfg = CP.load(path)
-            tag = "tied" if tie else "untied"
+            tag = ("tied" if tie else "untied") + ("+mlp" if d_int else "")
             rep.check(
                 "checkpoint", f"{tag}: config round-trip",
                 0.0 if got_cfg == cfg else 1.0, 1e-12,
@@ -1003,7 +1007,7 @@ def stage_checkpoint(env: Env, rep: Report) -> None:
         # A corrupt file must raise, not load a wrong model.
         with np.load(f32, allow_pickle=False) as z:
             entries = {k: z[k] for k in z.files}
-        del entries["blocks.1.in_proj"]
+        del entries["blocks.1.siso.in_proj"]
         broken = os.path.join(d, "broken.npz")
         np.savez(broken, **entries)
         raised = 0.0
@@ -1012,6 +1016,135 @@ def stage_checkpoint(env: Env, rep: Report) -> None:
         except ValueError:
             raised = 1.0
         rep.check("checkpoint", "missing array raises", 1.0 - raised, 1e-12)
+
+
+# --------------------------------------------------------------------------------------
+# Stage 7c: released-checkpoint format
+# --------------------------------------------------------------------------------------
+
+
+def _fake_released_sd(cfg, seed: int = 0) -> dict[str, np.ndarray]:
+    """A state dict shaped exactly like a ``state-spaces/mamba3-siso-*`` checkpoint.
+
+    Built here rather than downloaded so the format is testable offline. The key names,
+    shapes and transposes are what the real files have; only the values are random.
+    """
+    c = cfg.siso
+    rng = np.random.default_rng(seed)
+    n = lambda *s: (rng.normal(size=s) * 0.05).astype(np.float32)
+    g = lambda k: (1.0 + 0.1 * rng.normal(size=k)).astype(np.float32)
+    sd = {
+        "backbone.embedding.weight": n(cfg.vocab_size, c.d_model),
+        "backbone.norm_f.weight": g(c.d_model),
+    }
+    for i in range(cfg.n_layers):
+        p = f"backbone.layers.{i}."
+        sd[p + "norm.weight"] = g(c.d_model)
+        sd[p + "mixer.in_proj.weight"] = n(c.d_in_proj, c.d_model)
+        sd[p + "mixer.out_proj.weight"] = n(c.d_model, c.d_inner)
+        sd[p + "mixer.dt_bias"] = n(c.nheads)
+        sd[p + "mixer.B_bias"] = n(c.nheads, 1, c.d_state)
+        sd[p + "mixer.C_bias"] = n(c.nheads, 1, c.d_state)
+        sd[p + "mixer.B_norm.weight"] = g(c.d_state)
+        sd[p + "mixer.C_norm.weight"] = g(c.d_state)
+        sd[p + "mixer.D"] = n(c.nheads)
+        if cfg.d_intermediate:
+            sd[p + "norm2.weight"] = g(c.d_model)
+            sd[p + "mlp.fc1.weight"] = n(2 * cfg.d_intermediate, c.d_model)
+            sd[p + "mlp.fc2.weight"] = n(c.d_model, cfg.d_intermediate)
+    return sd
+
+
+def stage_pretrained(env: Env, rep: Report) -> None:
+    """Load a released-format checkpoint and match a torch stack on the same weights.
+
+    `stage_torch` covers one mixer. This covers the whole model: the
+    ``backbone.layers.N.mixer.*`` key mapping, the gated MLP the released checkpoints
+    carry (``d_intermediate=2*d_model``), the per-block second norm, vocab padding, and
+    the tied head. Those are exactly the parts that would load without error and produce
+    garbage if the mapping were wrong.
+
+    The reference here is a plain-torch transcription of ``MambaLMHeadModel.forward``
+    driving `torch_ref.Mamba3SISOTorch`, so it is independent of our JAX stack. Needs
+    torch; skipped otherwise.
+    """
+    try:
+        import torch
+        import torch.nn.functional as F
+
+        from . import torch_ref as TR
+    except ImportError as exc:
+        rep.note("pretrained", f"skipped: {exc}")
+        return
+
+    from . import convert as CV
+    from . import model as M
+
+    # The released 1.5b config, shrunk to something interpret mode can run. d_model has to
+    # stay >= headdim and d_state is fixed at the lane width.
+    cfg_json = {
+        "d_model": 128, "d_intermediate": 256, "n_layer": 3, "vocab_size": 60,
+        "pad_vocab_size_multiple": 16, "tie_embeddings": True,
+        "attn_layer_idx": [], "attn_cfg": {},
+        "ssm_cfg": {
+            "layer": "Mamba3", "d_state": 128, "expand": 2, "headdim": 64,
+            "ngroups": 1, "chunk_size": 64, "rope_fraction": 0.5, "A_floor": 1e-4,
+        },
+    }
+    cfg = CV.config_from_hf(cfg_json, chunk=env.chunk, policy_name="f32")
+
+    # 60 is not a multiple of 16, so the embedding must come out 64 wide.
+    rep.check("pretrained", "vocab padded 60 -> 64", abs(cfg.vocab_size - 64), 1e-12)
+    rep.check("pretrained", "chunk overridden from 64", abs(cfg.siso.chunk - env.chunk),
+              1e-12)
+
+    sd = _fake_released_sd(cfg)
+    params = CV.load_lm_state_dict(sd, cfg)
+    n_loaded = sum(int(x.size) for x in jax.tree.leaves(params))
+    rep.check("pretrained", "param count matches config",
+              abs(n_loaded - cfg.param_count()), 1e-12)
+
+    tokens = np.random.default_rng(1).integers(0, 60, (2, env.chunk)).astype(np.int32)
+
+    # Reference: MambaLMHeadModel.forward, in plain torch.
+    t = {k: torch.from_numpy(v) for k, v in sd.items()}
+    c = cfg.siso
+    x = F.embedding(torch.from_numpy(tokens), t["backbone.embedding.weight"])
+    for i in range(cfg.n_layers):
+        p = f"backbone.layers.{i}."
+        mixer = TR.Mamba3SISOTorch(
+            d_model=c.d_model, d_state=c.d_state, headdim=c.headdim, expand=c.expand,
+            rope_fraction=c.rope_fraction, a_floor=c.a_floor, norm_eps=c.norm_eps,
+        )
+        msd = {k[len(p + "mixer."):]: v for k, v in t.items() if k.startswith(p + "mixer.")}
+        msd["B_norm_weight"] = msd.pop("B_norm.weight")
+        msd["C_norm_weight"] = msd.pop("C_norm.weight")
+        mixer.load_state_dict(msd, strict=True)
+        with torch.no_grad():
+            x = x + mixer(TR.rms_norm_torch(x, t[p + "norm.weight"], c.norm_eps))
+            h = TR.rms_norm_torch(x, t[p + "norm2.weight"], c.norm_eps)
+            val, gate = (h @ t[p + "mlp.fc1.weight"].T).chunk(2, dim=-1)
+            x = x + (val * F.silu(gate)) @ t[p + "mlp.fc2.weight"].T
+    with torch.no_grad():
+        x = TR.rms_norm_torch(x, t["backbone.norm_f.weight"], c.norm_eps)
+        ref = (x @ t["backbone.embedding.weight"].T).numpy()
+
+    got = M.lm_forward(params, jnp.asarray(tokens), cfg, interpret=env.interpret)
+    rep.check("pretrained", "torch LM vs jax LM", rel_error(got, ref), 5e-2)
+    rep.check("pretrained", "torch LM vs jax LM (max rel)", max_rel(got, ref), 1e-3)
+
+    # A MIMO or hybrid checkpoint has to be refused, not silently half-loaded.
+    for bad, why in (
+        ({**cfg_json, "ssm_cfg": {**cfg_json["ssm_cfg"], "mimo": True}}, "MIMO"),
+        ({**cfg_json, "attn_layer_idx": [1]}, "attention layers"),
+    ):
+        raised = 0.0
+        try:
+            CV.config_from_hf(bad)
+        except ValueError:
+            raised = 1.0
+        rep.check("pretrained", f"rejects {why}", 1.0 - raised, 1e-12)
+
 
 
 
@@ -1142,6 +1275,7 @@ STAGES: dict[str, Callable[[Env, Report], None]] = {
     "decode": stage_decode,
     "torch": stage_torch,
     "checkpoint": stage_checkpoint,
+    "pretrained": stage_pretrained,
     "train": stage_train,
 }
 

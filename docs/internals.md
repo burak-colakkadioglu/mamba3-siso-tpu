@@ -241,6 +241,7 @@ they agree to 1.2e-08, which confirms it's the two formulations and not a kernel
 6  decode    both grids vs the step reference, scan vs loop, chain vs prefill, handoff
 7  torch     PyTorch reference on CPU vs JAX through convert.py
 7b checkpoint save/load: same config, same tree, same logits, bf16 storage
+7c pretrained released-checkpoint key mapping and gated MLP vs a torch stack
 8  train     memorize a token sequence (asserted), parity by SGD (reported)
 ```
 

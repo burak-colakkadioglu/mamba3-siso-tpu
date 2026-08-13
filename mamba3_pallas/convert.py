@@ -17,6 +17,11 @@ Three things have to change on the way across:
 Everything else -- ``dt_bias``, ``D``, ``out_proj`` -- passes through unchanged.
 ``A``, ``dt`` and ``lambda`` are per-head scalars, so they are permutation-invariant,
 and ``q~ . k~ == u . w`` because rotations are orthogonal.
+
+`torch_to_jax` handles one mixer. `load_lm_state_dict` handles a whole released
+checkpoint: ``state-spaces/mamba3-siso-*`` ships a ``MambaLMHeadModel`` state dict with
+``backbone.layers.N.mixer.*`` keys plus an embedding, per-block norms, an optional gated
+MLP and a final norm, so it needs the key mapping and the `model.LMConfig` too.
 """
 
 from __future__ import annotations
@@ -160,3 +165,183 @@ def jax_to_torch(params: LY.SISOParams, cfg: LY.SISOConfig) -> dict[str, np.ndar
         "C_bias": np.asarray(params.c_bias, np.float32)[:, inv][:, None, :],
         "D": np.asarray(params.d_skip, np.float32),
     }
+
+
+# --------------------------------------------------------------------------------------
+# Whole released checkpoints
+# --------------------------------------------------------------------------------------
+#
+# A `MambaLMHeadModel` state dict looks like this (n_layer blocks):
+#
+#     backbone.embedding.weight                     (vocab, d_model)
+#     backbone.layers.0.norm.weight                 (d_model,)
+#     backbone.layers.0.mixer.in_proj.weight        (d_in_proj, d_model)
+#     backbone.layers.0.mixer.out_proj.weight       (d_model, d_inner)
+#     backbone.layers.0.mixer.dt_bias               (nheads,)
+#     backbone.layers.0.mixer.B_bias                (nheads, mimo_rank, d_state)
+#     backbone.layers.0.mixer.C_bias                (nheads, mimo_rank, d_state)
+#     backbone.layers.0.mixer.B_norm.weight         (d_state,)
+#     backbone.layers.0.mixer.C_norm.weight         (d_state,)
+#     backbone.layers.0.mixer.D                     (nheads,)
+#     backbone.layers.0.norm2.weight                (d_model,)      if d_intermediate
+#     backbone.layers.0.mlp.fc1.weight              (2*d_int, d_model)
+#     backbone.layers.0.mlp.fc2.weight              (d_model, d_int)
+#     backbone.norm_f.weight                        (d_model,)
+#     lm_head.weight                                (vocab, d_model)
+#
+# `lm_head.weight` is the same tensor object as the embedding when tie_embeddings is set,
+# so it is present but redundant.
+
+MIXER_PREFIX = "backbone.layers.{i}.mixer."
+
+
+def config_from_hf(cfg_json: Mapping[str, Any], **overrides) -> "Any":
+    """A released ``config.json`` -> `model.LMConfig`.
+
+    Reads the fields the kernels need and ignores the rest (``fused_add_norm``,
+    ``residual_in_fp32`` and friends describe upstream's CUDA plumbing, not the math).
+
+    Two things are easy to get wrong:
+
+    * **vocab padding.** Upstream pads ``vocab_size`` up to
+      ``pad_vocab_size_multiple`` *inside* ``MambaLMHeadModel.__init__``, so the
+      embedding is wider than the config's ``vocab_size`` and the checkpoint's actual
+      width is the padded one. The padded number is what goes in the config here.
+    * **chunk.** ``config.json`` carries upstream's chunk size (64 for the released
+      models), which Mosaic cannot use. It is a tiling parameter, not a weight shape, so
+      it is overridden to 128 unless the caller says otherwise; the chunked algorithm is
+      identical at any chunk, which is what the ``segments`` test stage checks.
+
+    Raises:
+      ValueError: If the checkpoint is MIMO or has attention layers, neither of which
+        these kernels implement.
+    """
+    from . import model as M
+
+    ssm = dict(cfg_json.get("ssm_cfg", {}))
+    layer_name = ssm.pop("layer", "Mamba3")
+    if layer_name != "Mamba3":
+        raise ValueError(f"ssm_cfg.layer is {layer_name!r}, expected 'Mamba3'")
+    if ssm.get("mimo", False) or ssm.get("mimo_rank", 1) not in (1, None):
+        raise ValueError("this checkpoint is MIMO; only SISO is implemented")
+    if cfg_json.get("attn_layer_idx"):
+        raise ValueError(
+            f"checkpoint has attention layers at {cfg_json['attn_layer_idx']}; "
+            "hybrid attention/SSM stacks are not implemented"
+        )
+    if ssm.get("ngroups", 1) != 1:
+        raise ValueError(f"ngroups={ssm['ngroups']}, only ngroups=1 (SISO) is implemented")
+
+    vocab = int(cfg_json["vocab_size"])
+    mult = int(cfg_json.get("pad_vocab_size_multiple", 1) or 1)
+    if vocab % mult:
+        vocab += mult - (vocab % mult)
+
+    siso_kw: dict[str, Any] = {
+        "d_model": int(cfg_json["d_model"]),
+        "d_state": int(ssm.get("d_state", 128)),
+        "headdim": int(ssm.get("headdim", 64)),
+        "expand": int(ssm.get("expand", 2)),
+        "rope_fraction": float(ssm.get("rope_fraction", 0.5)),
+        "chunk": 128,
+    }
+    for src, dst in (("A_floor", "a_floor"), ("dt_min", "dt_min"), ("dt_max", "dt_max"),
+                     ("dt_init_floor", "dt_init_floor")):
+        if src in ssm:
+            siso_kw[dst] = float(ssm[src])
+    siso_kw.update({k: v for k, v in overrides.items() if k not in ("d_intermediate",)})
+
+    return M.LMConfig(
+        vocab_size=vocab,
+        n_layers=int(cfg_json["n_layer"]),
+        siso=LY.SISOConfig(**siso_kw),
+        tie_head=bool(cfg_json.get("tie_embeddings", True)),
+        d_intermediate=int(cfg_json.get("d_intermediate", 0)),
+    )
+
+
+def load_lm_state_dict(sd: Mapping[str, Any], cfg: "Any", dtype=jnp.float32) -> "Any":
+    """A released ``MambaLMHeadModel`` state dict -> `model.LMParams`.
+
+    Args:
+      sd: The full checkpoint, with ``backbone.``-prefixed keys.
+      cfg: From `config_from_hf`.
+
+    Raises:
+      KeyError: If a key the config implies is absent, with the key name. Loading a
+        partially-mapped model would produce plausible-looking garbage, so this is strict.
+    """
+    from . import model as M
+
+    def get(key: str) -> np.ndarray:
+        if key not in sd:
+            raise KeyError(f"checkpoint is missing {key!r}")
+        return _to_numpy(sd[key])
+
+    embed = get("backbone.embedding.weight")
+    if embed.shape != (cfg.vocab_size, cfg.d_model):
+        raise ValueError(
+            f"embedding is {embed.shape}, config implies "
+            f"{(cfg.vocab_size, cfg.d_model)}; check pad_vocab_size_multiple"
+        )
+
+    blocks = []
+    for i in range(cfg.n_layers):
+        pre = MIXER_PREFIX.format(i=i)
+        mixer = {k[len(pre):]: sd[k] for k in sd if k.startswith(pre)}
+        if not mixer:
+            raise KeyError(f"no keys under {pre!r}; is this a Mamba-3 checkpoint?")
+        siso = torch_to_jax(mixer, cfg.siso, dtype)
+
+        mlp = None
+        mlp_norm = None
+        if cfg.d_intermediate:
+            mlp = M.MLPParams(
+                fc1=jnp.asarray(get(f"backbone.layers.{i}.mlp.fc1.weight").T, dtype),
+                fc2=jnp.asarray(get(f"backbone.layers.{i}.mlp.fc2.weight").T, dtype),
+            )
+            mlp_norm = jnp.asarray(get(f"backbone.layers.{i}.norm2.weight"), dtype)
+        blocks.append(
+            M.BlockParams(
+                norm_gain=jnp.asarray(get(f"backbone.layers.{i}.norm.weight"), dtype),
+                siso=siso,
+                mlp_norm_gain=mlp_norm,
+                mlp=mlp,
+            )
+        )
+
+    # Tied heads share storage upstream, so `lm_head.weight` is present either way; only
+    # read it when the config says it is a separate matrix.
+    head = None if cfg.tie_head else jnp.asarray(get("lm_head.weight").T, dtype)
+    return M.LMParams(
+        embed=jnp.asarray(embed, dtype),
+        blocks=blocks,
+        final_norm=jnp.asarray(get("backbone.norm_f.weight"), dtype),
+        head=head,
+    )
+
+
+def load_pretrained(
+    repo_id: str, dtype=jnp.float32, revision: str | None = None, **cfg_overrides
+) -> tuple[Any, Any]:
+    """Download a released checkpoint from the Hugging Face Hub. ``(params, cfg)``.
+
+        params, cfg = convert.load_pretrained("state-spaces/mamba3-siso-1.5b")
+
+    Needs ``huggingface_hub`` and ``torch`` (the weights are a ``pytorch_model.bin``,
+    which is a pickle, so torch has to unpickle it). Both are optional dependencies here.
+    """
+    import json
+
+    from huggingface_hub import hf_hub_download
+
+    cfg_path = hf_hub_download(repo_id, "config.json", revision=revision)
+    with open(cfg_path) as fh:
+        cfg = config_from_hf(json.load(fh), **cfg_overrides)
+
+    import torch
+
+    bin_path = hf_hub_download(repo_id, "pytorch_model.bin", revision=revision)
+    sd = torch.load(bin_path, map_location="cpu", weights_only=True)
+    return load_lm_state_dict(sd, cfg, dtype), cfg
+

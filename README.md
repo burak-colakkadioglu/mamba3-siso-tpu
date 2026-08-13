@@ -109,10 +109,28 @@ different one when `P=64`, and the mismatch gets paid as a transposing copy on `
 `phi` and `y`. Details in
 [internals](docs/internals.md#operand-layouts-worth-21-26-of-forward).
 
-Loading a PyTorch checkpoint:
+## Released checkpoints
+
+The `state-spaces/mamba3-siso-*` models load and run:
 
 ```python
-from mamba3_pallas import convert as CV
+from mamba3_pallas import convert as CV, model as M
+
+params, cfg = CV.load_pretrained("state-spaces/mamba3-siso-1.5b")
+logits = M.lm_forward(params, tokens, cfg)
+```
+
+That handles the `backbone.layers.N.mixer.*` key mapping, the transposes, the rotary
+permutation, the gated MLP those checkpoints carry (`d_intermediate = 2 * d_model`) and the
+vocab padding. Needs `torch` to unpickle the `.bin` and `huggingface_hub` to fetch it.
+Tokenizer is not in those repos, they point at `meta-llama/Llama-3.1-8B`, which is gated.
+
+MIMO checkpoints and hybrid attention stacks are refused with a clear error rather than
+half loaded.
+
+Single layer, from a raw `state_dict`:
+
+```python
 cfg = CV.config_from_state_dict(sd, headdim=64)
 params = CV.torch_to_jax(sd, cfg)
 ```
@@ -124,14 +142,15 @@ python -m mamba3_pallas.tests          # CPU, interpret mode
 python -m mamba3_pallas.tests --tpu    # real shapes, needs a TPU
 ```
 
-All pass on a v5e-8. Almost all of it also passes with no TPU at all, 102 checks: `lower` 40,
+All pass on a v5e-8. Almost all of it also passes with no TPU at all, 112 checks: `lower` 40,
 `shapes` 8, `refs` 4, `rotation` 4, `forward` 13, `backward` 13, `segments` 6, `torch` 3,
-`checkpoint` 11. That is every stage except `decode` and `train`, which are too slow in
-interpret mode to sit in a quick run. Run them yourself:
+`checkpoint` 14, `pretrained` 7. That is every stage except `decode` and `train`, which are
+too slow in interpret mode to sit in a quick run. Run them yourself:
 
 ```bash
 python -m mamba3_pallas.tests --stage lower --stage shapes --stage refs --stage rotation \
-    --stage forward --stage backward --stage segments --stage torch --stage checkpoint
+    --stage forward --stage backward --stage segments --stage torch --stage checkpoint \
+    --stage pretrained
 ```
 
 Two things make that possible on a machine with no TPU:
@@ -189,10 +208,10 @@ mamba3_pallas/
   siso.py          custom_vjp glue
   layer.py         config, params, the layer, optional Flax NNX module
   model.py         stacked LM
-  convert.py       torch state_dict -> params
+  convert.py       torch state_dict -> params, released checkpoint loader
   checkpoint.py    save/load trained weights as npz
   torch_ref.py     vendored PyTorch reference, CPU only
-  tests.py         11 test stages
+  tests.py         12 test stages
   train.py         byte level LM training
 docs/internals.md  design decisions and constraints
 ```
