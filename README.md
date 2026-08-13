@@ -162,6 +162,12 @@ path (Kaggle `/kaggle/input/...` mounts work).
 model shape comes from the file so you don't have to repeat the `--d-model`/`--n-layers`
 flags.
 
+Training on your own text, pass `--prompt` too. The generation prefix defaults to something
+the named corpora contain (`[[The ` for enwik8, which is wiki link syntax) and a prompt your
+corpus never contains is out of distribution, so the first bytes come out as noise before
+the model recovers. `--rep-penalty 1.0` is also worth trying on prose; the 1.15 default suits
+enwik8 entity runs and over-corrects on naturally repetitive text.
+
 Weights are a plain npz, no pickle, with the config stored alongside them:
 
 ```python

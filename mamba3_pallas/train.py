@@ -521,8 +521,15 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--temperature", type=float, default=0.9)
     ap.add_argument("--top-p", type=float, default=0.95)
     ap.add_argument("--rep-penalty", type=float, default=1.15,
-                    help="1.0 disables; enwik8 entity runs need ~1.1-1.2")
+                    help="1.0 disables. enwik8 entity runs need ~1.1-1.2; naturally "
+                         "repetitive text like children's stories reads better at 1.0")
     ap.add_argument("--sample-bytes", type=int, default=384)
+    ap.add_argument(
+        "--prompt", default=None, metavar="TEXT",
+        help="prefix to generate from. Default is picked from the corpus, so pass this "
+             "when training on your own text: a prompt the corpus never contains is out "
+             "of distribution and the first tokens come out as noise.",
+    )
     ap.add_argument(
         "--save", default=None, metavar="PATH",
         help="write the best-validation weights to PATH as an npz (see "
@@ -780,7 +787,9 @@ def main(argv: list[str] | None = None) -> int:
         print(f"  reload it with: mamba3_pallas.checkpoint.load({written!r})")
 
     key = jax.random.key(args.seed + 2)
-    prompt = b"the " if args.corpus == "synthetic" else b"[[The "
+    prompt = default_prompt(args.corpus, label) if args.prompt is None else (
+        args.prompt.encode("utf-8")
+    )
     print(f"\n--- sample (T={args.temperature} top_p={args.top_p}"
           f" rep={args.rep_penalty},"
           f" {'decode kernel' if L.on_tpu() else 'interpret'}) ---")
@@ -806,6 +815,29 @@ def main(argv: list[str] | None = None) -> int:
     body = text[len(prompt):]
     print(f"    {uniq_bytes(body)} distinct bytes, {degeneracy(body)}")
     return 0
+
+
+def default_prompt(corpus: str, label: str) -> bytes:
+    """A generation prefix the trained corpus actually contains.
+
+    This matters more than it looks. The prompt is the model's whole context at token 0,
+    and a prefix that never appears in training is out of distribution: the first several
+    bytes come out as noise until the model hits something it recognizes (often an
+    end-of-document marker) and restarts cleanly. It reads like a broken model and is not.
+
+    ``[[The `` is wiki link syntax, which is right for enwik8/enwik9 and wrong for
+    everything else, so only those get it. A path corpus gets a bare capital letter, since
+    nothing can be assumed about its contents. Pass ``--prompt`` to override.
+    """
+    if corpus == "synthetic":
+        return b"the "
+    if "enwik" in label:
+        return b"[[The "
+    if "text8" in label:
+        return b" the "
+    if "shakespeare" in label:
+        return b"KING RICHARD"
+    return b"The "
 
 
 def uniq_bytes(body: bytes) -> int:
