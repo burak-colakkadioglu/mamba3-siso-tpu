@@ -99,6 +99,11 @@ def synthetic_corpus(n_bytes: int, seed: int = 0) -> np.ndarray:
     return np.frombuffer(bytes(out[:n_bytes]), dtype=np.uint8)
 
 
+#: Global gradient-norm clip. Applied by `optax.clip_by_global_norm` on the replicated
+#: path, and by hand in `make_step` on the ZeRO-2 path, where optax would only see one
+#: shard and clip by a local norm. Same constant so the two paths agree.
+CLIP_NORM = 1.0
+
 #: Byte corpora that can be fetched, each with several candidate URLs tried in order so a
 #: dead mirror is a logged line and not a traceback. First URL is the canonical home: Matt
 #: Mahoney's compression-benchmark directory, which is where every published bits/char
@@ -386,12 +391,17 @@ def init_optimizer(opt, params: M.LMParams, mesh=None, shard_state: bool = False
 
     Adam keeps two moments the size of the params, and data parallelism replicates them on
     every chip. At 787M f32 that is 5.87 GiB per chip of pure optimizer state, which is
-    what stops a model that size from training on a v5e even after donation.
+    what stops a model that size from training on a v5e at a useful batch.
 
-    ``shard_state=True`` is ZeRO-1: ravel the params into one 1-D vector, shard it over the
-    mesh, and keep the moments only for the local slice. Each chip then holds
-    ``2 * P / n_dev`` scalars instead of ``2 * P``. Params themselves stay replicated, so
-    the forward is unchanged and the cost is one all-gather of the updates per step.
+    ``shard_state=True`` is ZeRO-2: gradients are reduce-scattered rather than all-reduced,
+    so each chip only ever holds ``1/n_dev`` of the gradient and ``1/n_dev`` of the moments.
+    Params stay replicated (that is what makes it ZeRO-2 rather than ZeRO-3, and it keeps
+    the forward untouched, with no per-layer all-gather). Per chip:
+
+        replicated   params P + grads P + moments 2P      = 4P
+        ZeRO-2       params P + grads P/n + moments 2P/n
+
+    At 787M on 8 chips that is 11.73 GiB down to 4.03 GiB.
 
     Returns ``flat_spec = None`` when not sharding, so `make_step` knows which path to take.
     """
@@ -404,8 +414,10 @@ def init_optimizer(opt, params: M.LMParams, mesh=None, shard_state: bool = False
     size = _flat_size(params)
     padded = -(-size // n_dev) * n_dev          # ceil to a whole number of shards
     spec = NamedSharding(mesh, P("data"))
-    flat = jax.device_put(jnp.zeros((padded,), jnp.float32), spec)
-    return opt.init(flat), (size, padded, spec, NamedSharding(mesh, P()))
+    # Optimizer state is built from a *shard-sized* vector: the moments only ever exist
+    # for the local slice, which is the point.
+    local = jax.device_put(jnp.zeros((padded,), jnp.float32), spec)
+    return opt.init(local), (size, padded, n_dev, spec, NamedSharding(mesh, P()))
 
 
 def make_step(cfg: M.LMConfig, opt, interpret: Any, mesh=None, flat_spec=None):
@@ -439,10 +451,9 @@ def make_step(cfg: M.LMConfig, opt, interpret: Any, mesh=None, flat_spec=None):
     ``tree.map``, which only rebuilds the tree around the same buffers.
 
     Args:
-      flat_spec: From `init_optimizer` with ``shard_state=True``. Switches the update to
-        the sharded-optimizer path. The Adam math is elementwise on the flat vector, so
-        GSPMD partitions it from the sharding constraints alone; only the kernel needs
-        ``shard_map``, and that stays inside ``grad_fn``.
+      flat_spec: From `init_optimizer` with ``shard_state=True``. Switches to the ZeRO-2
+        path: gradients are reduce-scattered inside the shard_map instead of all-reduced,
+        and the optimizer runs on the local shard only.
     """
     import optax
 
@@ -461,23 +472,23 @@ def make_step(cfg: M.LMConfig, opt, interpret: Any, mesh=None, flat_spec=None):
 
     from jax.sharding import PartitionSpec as P
 
-    def sharded_grad(params, xs, ys):
-        """Per-device loss and gradient, averaged over the data axis."""
-        loss, grads = jax.value_and_grad(loss_fn)(params, xs, ys)
-        return jax.lax.pmean(loss, "data"), jax.lax.pmean(grads, "data")
-
-    # Params replicated, data sharded on axis 0. `check_vma=False` because pallas_call
-    # builds its outputs from ShapeDtypeStructs that carry no manual_axis_type, which the
-    # varying-manual-axes check wants.
-    grad_fn = jax.shard_map(
-        sharded_grad,
-        mesh=mesh,
-        in_specs=(P(), P("data"), P("data")),
-        out_specs=(P(), P()),
-        check_vma=False,
-    )
-
     if flat_spec is None:
+        def sharded_grad(params, xs, ys):
+            """Per-device loss and gradient, averaged over the data axis."""
+            loss, grads = jax.value_and_grad(loss_fn)(params, xs, ys)
+            return jax.lax.pmean(loss, "data"), jax.lax.pmean(grads, "data")
+
+        # Params replicated, data sharded on axis 0. `check_vma=False` because pallas_call
+        # builds its outputs from ShapeDtypeStructs that carry no manual_axis_type, which
+        # the varying-manual-axes check wants.
+        grad_fn = jax.shard_map(
+            sharded_grad,
+            mesh=mesh,
+            in_specs=(P(), P("data"), P("data")),
+            out_specs=(P(), P()),
+            check_vma=False,
+        )
+
         @functools.partial(jax.jit, donate_argnums=(0, 1))
         def step(params, opt_state, xs, ys):
             loss, grads = grad_fn(params, xs, ys)
@@ -486,26 +497,58 @@ def make_step(cfg: M.LMConfig, opt, interpret: Any, mesh=None, flat_spec=None):
 
         return step
 
-    size, padded, shard, repl = flat_spec
+    size, padded, n_dev, shard, repl = flat_spec
     # `jax.make_mesh` builds Explicit axes, and `with_sharding_constraint` only accepts
     # Auto ones ("You probably meant to use `reshard`"). `reshard` is the Explicit-mesh
-    # equivalent and is what moves the flat vector between sharded and replicated.
+    # equivalent.
     from jax.sharding import reshard
 
-    def flatten(tree):
-        flat = jnp.concatenate([x.reshape(-1) for x in jax.tree.leaves(tree)])
+    def scattered_grad(params, xs, ys):
+        """Per-device loss, and the local *shard* of the averaged gradient.
+
+        The gradient is raveled inside the shard_map and reduce-scattered, so the full
+        averaged gradient is never materialized anywhere. That is the ZeRO-2 difference:
+        ``pmean`` would build all P of it on every chip only for the caller to keep 1/n.
+
+        Communication is also lower. A ring all-reduce moves ``2 * (n-1)/n`` bytes per
+        device, a reduce-scatter moves ``(n-1)/n``, so all-reduce + all-gather (ZeRO-1) is
+        2.62P against reduce-scatter + all-gather's 1.75P, which is what plain data
+        parallelism already pays.
+        """
+        loss, grads = jax.value_and_grad(loss_fn)(params, xs, ys)
+        flat = jnp.concatenate([g.reshape(-1) for g in jax.tree.leaves(grads)])
+        if padded > size:
+            flat = jnp.pad(flat, (0, padded - size))
+        # `tiled=True` splits the leading axis; dividing by n_dev turns the sum into a mean.
+        local = jax.lax.psum_scatter(flat, "data", tiled=True) / n_dev
+        return jax.lax.pmean(loss, "data"), local
+
+    grad_fn = jax.shard_map(
+        scattered_grad,
+        mesh=mesh,
+        in_specs=(P(), P("data"), P("data")),
+        out_specs=(P(), P("data")),
+        check_vma=False,
+    )
+
+    def flat_params(params):
+        flat = jnp.concatenate([x.reshape(-1) for x in jax.tree.leaves(params)])
         if padded > size:
             flat = jnp.pad(flat, (0, padded - size))
         return reshard(flat, shard)
 
     @functools.partial(jax.jit, donate_argnums=(0, 1))
     def step(params, opt_state, xs, ys):
-        loss, grads = grad_fn(params, xs, ys)
-        # Ravel to one vector and shard it, so Adam's moments only ever exist per shard.
-        # The padding tail carries zero gradient, so it stays at zero and never
-        # contributes to an update.
-        flat_g = flatten(grads)
-        flat_p = flatten(params)
+        loss, flat_g = grad_fn(params, xs, ys)
+        flat_p = flat_params(params)
+        # Global-norm clipping has to be done here, not by `optax.clip_by_global_norm`
+        # inside `opt`: that computes the norm of whatever it is handed, so on a shard it
+        # would clip by the *local* norm and every chip would scale differently. A
+        # reduction over a sharded array is a global reduction under Explicit sharding, so
+        # this sum is the true global one and costs a scalar all-reduce.
+        gsq = jnp.sum(flat_g.astype(jnp.float32) ** 2)
+        gnorm = jnp.sqrt(gsq)
+        flat_g = jnp.where(gnorm < CLIP_NORM, flat_g, flat_g * (CLIP_NORM / gnorm))
         updates, opt_state = opt.update(flat_g, opt_state, flat_p)
         new_flat = optax.apply_updates(flat_p, updates)
         # One all-gather per step: params stay replicated so the forward is untouched.
@@ -738,9 +781,10 @@ def main(argv: list[str] | None = None) -> int:
     )
     ap.add_argument(
         "--shard-optimizer", action="store_true",
-        help="shard Adam's moments across chips (ZeRO-1) instead of replicating them. "
-             "Saves 2*params*4/n_dev bytes per chip, which is what lets a large model fit; "
-             "costs one all-gather of the updates per step. Multi chip only.",
+        help="ZeRO-2: reduce-scatter the gradient and shard Adam's moments across chips "
+             "instead of replicating both. Cuts per-chip state from 4*params*4 bytes to "
+             "(1 + 3/n_dev)*params*4, 11.7 GiB to 4.0 at 787M on 8 chips, which is what "
+             "lets a large model run at a useful batch. Multi chip only.",
     )
     ap.add_argument(
         "--pin-layouts", action="store_true",
@@ -874,7 +918,12 @@ def main(argv: list[str] | None = None) -> int:
         init_value=args.lr * 0.1, peak_value=args.lr, warmup_steps=args.warmup,
         decay_steps=max(args.steps, args.warmup + 1), end_value=args.lr * 0.1,
     )
-    opt = optax.chain(optax.clip_by_global_norm(1.0), optax.adamw(sched, weight_decay=0.1))
+    # ZeRO-2 clips by hand inside `make_step` (optax would see one shard and clip by its
+    # local norm), so the chained clip only belongs on the replicated path.
+    stages = [] if args.shard_optimizer and mesh is not None else [
+        optax.clip_by_global_norm(CLIP_NORM)
+    ]
+    opt = optax.chain(*stages, optax.adamw(sched, weight_decay=0.1))
 
     # `shard_map` rejects arguments whose sharding does not already match `in_specs` --
     # it will not reshard for you. So params are placed replicated once here, and each

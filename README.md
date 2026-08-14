@@ -203,18 +203,37 @@ path (Kaggle `/kaggle/input/...` mounts work).
 model shape comes from the file so you don't have to repeat the `--d-model`/`--n-layers`
 flags.
 
-Two flags for larger models on a v5e-8:
+Two flags for larger models on a v5e-8. Both are situational, measured numbers below.
 
-- `--shard-optimizer` shards Adam's two moments across chips (ZeRO-1) instead of
-  replicating them. Saves `2 * params * 4 / n_dev` bytes per chip, 5.1 GiB at 787M on 8
-  chips, which is what lets a big model fit at a useful batch. Costs one all-gather of the
-  updates per step. The loss curve is identical, verified step for step.
-- `--pin-layouts` pins operand layouts at the step's jit boundary, worth ~20% of forward
-  time. Multi chip only, since there is no sharding to rebuild on a single device.
+- `--shard-optimizer` is ZeRO-2: reduce-scatter the gradient and shard Adam's moments,
+  instead of all-reducing and replicating both. Per-chip state at 787M on 8 chips goes
+  11.7 GiB to 4.0. Loss curve is bit-identical to the replicated path, verified step for
+  step. It is a fit-or-do-not-run lever, not a speedup: it costs throughput per token and
+  buys you a batch size you could not otherwise reach.
+- `--pin-layouts` pins operand layouts at the step's jit boundary. Worth ~20% on a bare
+  forward at `L=8192`, but only ~2.5% inside a training step at these shapes, which is
+  close to run-to-run noise. Multi chip only.
+
+Measured on a v5e-8, 787M params 16 layers, `--seqlen 512 --chunk 512`, steady state with
+compile excluded:
+
+| | tok/s | |
+|---|---|---|
+| batch 4, no flags | **~44,900** | best |
+| batch 6 + ZeRO-2 | not yet measured | |
+| batch 6 + ZeRO-1 (old) | 39,500 | |
+| batch 4 + ZeRO-1 + pin | 35,400 | |
+| batch 4 + ZeRO-1 | 34,500 | |
+| batch 6, no flags | OOM | needs 18.7 GiB |
+
+The old ZeRO-1 all-reduced the gradient and then threw away 7/8 of it, so it moved 2.62
+param-copies per step against plain data parallelism's 1.75. ZeRO-2's reduce-scatter is
+back down to 1.75, so it should land much closer to baseline. Re-measure before trusting
+any of this on your own shapes.
 
 ```bash
 python -m mamba3_pallas.train --steps 2000 --d-model 2816 --n-layers 16 --batch 4 \
-    --seqlen 512 --chunk 512 --corpus enwik8 --shard-optimizer --pin-layouts
+    --seqlen 512 --chunk 512 --corpus enwik8
 ```
 
 Training on your own text, pass `--prompt` too. The generation prefix defaults to something

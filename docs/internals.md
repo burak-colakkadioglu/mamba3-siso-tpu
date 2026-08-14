@@ -240,19 +240,50 @@ keeps it out of HBM.
 
 Also worth knowing: this floor is independent of `seqlen`. The model is recurrent, activation
 memory per step doesn't grow with sequence length the way attention's does, so shortening
-the sequence does not help an OOM that is really about parameter copies. What does help is
-`--shard-optimizer`: Adam's two moments are the only replicated state that has no reason to
-be replicated, since each element's update depends only on that element. Raveling the params
-into one vector, sharding it over the mesh and keeping moments for the local slice turns
-`2 * P * 4` bytes per chip into `2 * P * 4 / n_dev`, 5.87 GiB down to 0.73 GiB at 787M on 8
-chips. The cost is one all-gather of the updates per step; params stay replicated so the
-forward is untouched.
+the sequence does not help an OOM that is really about parameter copies.
 
-Two API details that path ran into. `jax.make_mesh` builds `Explicit` axes, and
-`with_sharding_constraint` only accepts `Auto` ones, so the sharded/replicated moves use
-`jax.sharding.reshard`. And `jax.eval_shape` reports shardings carrying an `AbstractMesh`,
-which `out_shardings` rejects (`_device_assignment is not implemented`), so the specs get
-rebuilt against the concrete mesh.
+### ZeRO-2
+
+`--shard-optimizer` attacks the floor itself. Gradients and Adam's moments are both
+replicated by plain data parallelism and neither has to be: the gradient is summed across
+chips anyway, and each moment element's update depends only on that element. Per chip, with
+`P` the size of one f32 copy of the params:
+
+```
+replicated   params P + grads P     + moments 2P     = 4P    11.73 GiB at 787M
+ZeRO-2       params P + grads P/n   + moments 2P/n          4.03 GiB on 8 chips
+```
+
+Params stay replicated, which is what makes this ZeRO-2 and not ZeRO-3, and it keeps the
+forward untouched: no per-layer all-gather, and the Pallas kernels never see a partial
+tensor.
+
+The gradient is raveled and `psum_scatter`ed *inside* the `shard_map`, so the full averaged
+gradient is never materialized. Getting this wrong is easy and expensive. A first version
+used `pmean` and then sharded the result, which builds all of `P` on every chip only to
+discard 7/8 of it, and it moves more data than not sharding at all:
+
+```
+all-reduce               2(n-1)/n = 1.75P     plain data parallel
+all-reduce + all-gather  2.62P                the pmean version, worse
+reduce-scatter + gather  1.75P                psum_scatter, back to parity
+```
+
+That version measured 34.5K tok/s against 44.9K for plain data parallelism at the same
+batch, and the extra 0.87P of traffic is the likely cause.
+
+One correctness trap: `optax.clip_by_global_norm` computes the norm of whatever it is
+handed, so on a shard each chip would clip by its own local norm and the chips would scale
+differently. `make_step` clips by hand instead, and because a reduction over a sharded array
+is a global reduction under Explicit sharding, `jnp.sum(g**2)` gives the true global norm for
+one scalar all-reduce. With that, the ZeRO-2 loss curve is bit-identical to the replicated
+one, which is the check worth running after touching any of this.
+
+Two API details. `jax.make_mesh` builds `Explicit` axes and `with_sharding_constraint` only
+accepts `Auto` ones, so the sharded/replicated moves use `jax.sharding.reshard`. And
+`jax.eval_shape` reports shardings carrying an `AbstractMesh`, which `out_shardings` rejects
+(`_device_assignment is not implemented`), so the specs get rebuilt against the concrete
+mesh.
 
 ## Numerics
 
