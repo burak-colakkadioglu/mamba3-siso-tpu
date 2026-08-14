@@ -1002,6 +1002,17 @@ def main(argv: list[str] | None = None) -> int:
     t0 = time.perf_counter()
     losses: list[float] = []
     val_hist: list[tuple[int, float]] = []
+    # Throughput is reported per interval, not cumulatively. `total_tokens / total_elapsed`
+    # carries the one-off compile in its denominator forever, so it starts far too low and
+    # creeps upward for the whole run: at 787M it read 27K at step 200 against a true 35.6K,
+    # and it converges from below without ever reaching the real rate. Timing each interval
+    # instead gives a number that is flat once compile is done, which is the number to quote.
+    #
+    # `val_seconds` is subtracted because validation runs inside the interval it is logged
+    # in, and it is not training work.
+    marks: list[tuple[int, float]] = []          # (step, wall clock) at each log line
+    rates: list[float] = []                      # steady-state interval rates
+    best: tuple[float, int, Any] | None = None
     # Keep the best-validation params. Held-out loss on a small corpus turns around well
     # before the schedule ends, so reporting the final params understates the model by
     # however far past its optimum the run went.
@@ -1010,7 +1021,6 @@ def main(argv: list[str] | None = None) -> int:
     # this snapshot came from get deleted on the next step: a `jax.tree.map(lambda t: t,
     # params)` would rebuild the tree around those same dead buffers. Host numpy also keeps
     # the snapshot out of HBM, which matters at scale since it is a full params-sized copy.
-    best: tuple[float, int, Any] | None = None
     for i in range(1, args.steps + 1):
         xs, ys = next(stream)
         loss, params, opt_state = step(
@@ -1020,9 +1030,11 @@ def main(argv: list[str] | None = None) -> int:
         if i % args.log_every == 0 or i == 1:
             jax.block_until_ready(loss)
             recent = float(np.mean(losses[-args.log_every :]))
-            vcol = ""
+            now = time.perf_counter()
+            vcol, val_seconds = "", 0.0
             if args.val_every and (i % args.val_every == 0 or i == args.steps):
                 v = evaluate(params)
+                val_seconds = time.perf_counter() - now
                 val_hist.append((i, v))
                 mark = " "
                 if best is None or v < best[0]:
@@ -1030,8 +1042,17 @@ def main(argv: list[str] | None = None) -> int:
                     mark = "*"
                 vcol = f"{v / math.log(2):8.3f}{mark}"
             el = time.perf_counter() - t0
+            tcol = ""
+            if marks:
+                prev_i, prev_t = marks[-1]
+                dt = now - prev_t
+                if dt > 0:
+                    rate = (i - prev_i) * global_batch * args.seqlen / dt
+                    rates.append(rate)
+                    tcol = f"{rate:12,.0f}"
+            marks.append((i, now + val_seconds))
             print(f"{i:6d} {recent:8.4f} {recent / math.log(2):10.3f} {vcol:>9s}"
-                  f" {global_batch * args.seqlen * i / el:12,.0f} {el:8.1f}s")
+                  f" {tcol:>12s} {el:8.1f}s")
 
     # Average the last 5% of steps, floored at 10 and capped at 200. A fixed window like
     # `losses[-50:]` would cover most of a short run and report a loss the model passed
@@ -1050,6 +1071,17 @@ def main(argv: list[str] | None = None) -> int:
           f"   [mean of last {tail} steps]")
     print(f"HELD-OUT   {val:.4f} nats ({val / math.log(2):.3f} bits/byte)"
           f"   <- the number that counts")
+    if rates:
+        # The first interval carries compilation, so it is excluded when there is anything
+        # else to average. Report the median: a single interval that happened to include a
+        # host hiccup should not move the headline number.
+        steady = sorted(rates[1:] or rates)
+        mid = steady[len(steady) // 2]
+        n_int = len(steady)
+        print(f"SPEED      {mid:,.0f} tok/s"
+              f"   ({global_batch * args.seqlen / mid * 1000:.0f} ms/step,"
+              f" median of {n_int} interval{'' if n_int == 1 else 's'},"
+              f"{'' if len(rates) > 1 else ' INCLUDING compile,'} log-interval timing)")
     if best is not None and best[1] < args.steps:
         print(f"  best at step {best[1]} of {args.steps};"
               f" final was {val_final / math.log(2):.3f} bpb"

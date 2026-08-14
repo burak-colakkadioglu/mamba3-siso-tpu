@@ -61,12 +61,17 @@ One v5e chip, B=8 H=32 L=8192 N=128 P=64, bf16:
 | forward + backward | 80.1 ms |
 | vs `lax.associative_scan` | **60x** faster at L=8192 |
 | training on 8 chips | **~495K tok/s** at 30.8M params |
+| training on 8 chips | **44.9K tok/s** at 787M params, 16 layers |
 | decode, B=256 | 1.4 ms/token |
 
-Every number here was measured by hand on a v5e-8. Nothing measures throughput
-automatically, so if you change the kernels, re-measure. The forward is compute bound at
-these shapes and the decode is bandwidth bound, which is why the two are reported
-differently.
+The forward and decode rows were measured by hand. The two training rows are the `SPEED`
+line `train.py` prints, which times each log interval and drops the first one so
+compilation is not averaged in. Nothing measures the kernels automatically, so if you
+change them, re-measure. Forward is compute bound at these shapes and decode is bandwidth
+bound, which is why the two are reported differently.
+
+Note the 30.8M row predates the `SPEED` line and came from the old cumulative counter, so
+it understates the steady-state rate.
 
 ## Install
 
@@ -214,22 +219,26 @@ Two flags for larger models on a v5e-8. Both are situational, measured numbers b
   forward at `L=8192`, but only ~2.5% inside a training step at these shapes, which is
   close to run-to-run noise. Multi chip only.
 
-Measured on a v5e-8, 787M params 16 layers, `--seqlen 512 --chunk 512`, steady state with
-compile excluded:
+Measured on a v5e-8, 787M params 16 layers, `--seqlen 512 --chunk 512`. These are the
+`SPEED` line the run prints, the median of the per-interval rates with compile excluded:
 
 | | tok/s | |
 |---|---|---|
-| batch 4, no flags | **~44,900** | best |
-| batch 6 + ZeRO-2 | not yet measured | |
-| batch 6 + ZeRO-1 (old) | 39,500 | |
-| batch 4 + ZeRO-1 + pin | 35,400 | |
-| batch 4 + ZeRO-1 | 34,500 | |
+| batch 4, no flags | **44,900** | best |
+| batch 6 + ZeRO-2 | 40,400 | |
+| batch 6 + ZeRO-1 (removed) | 39,500 | |
+| batch 4 + ZeRO-2 | 35,700 | |
+| batch 4 + ZeRO-1 + pin (removed) | 35,400 | |
+| batch 4 + ZeRO-1 (removed) | 34,500 | |
 | batch 6, no flags | OOM | needs 18.7 GiB |
+| batch 8 + ZeRO-2 | OOM | needs 15.90 GiB |
 
-The old ZeRO-1 all-reduced the gradient and then threw away 7/8 of it, so it moved 2.62
-param-copies per step against plain data parallelism's 1.75. ZeRO-2's reduce-scatter is
-back down to 1.75, so it should land much closer to baseline. Re-measure before trusting
-any of this on your own shapes.
+ZeRO-2 beat ZeRO-1 by 2-3% at both batch sizes, which is less than the communication
+analysis predicted: reduce-scatter brings traffic back to plain data parallelism's 1.75
+param-copies per step, from ZeRO-1's 2.62, so parity was the expectation. The remaining gap
+is the flatten and slice work around the sharded update rather than the collectives.
+
+Re-measure on your own shapes. Every number here is one model at one sequence length.
 
 ```bash
 python -m mamba3_pallas.train --steps 2000 --d-model 2816 --n-layers 16 --batch 4 \
