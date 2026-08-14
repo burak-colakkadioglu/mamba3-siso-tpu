@@ -296,7 +296,12 @@ def bigram_baseline(data: np.ndarray) -> float:
 
 
 def pin_step_layouts(step, params, opt_state, xs, ys, mesh=None):
-    """Re-jit ``step`` with every operand pinned to the descending layout.
+    """Pin every operand of ``step`` to the descending layout.
+
+    Returns ``(step, params, opt_state, pin_batch)``. ``params`` and ``opt_state`` come back
+    moved into the descending layout, and ``pin_batch`` has to be applied to each batch on
+    the way in. Returns the inputs unchanged (and ``pin_batch=None``) when there is nothing
+    to pin.
 
     Mosaic custom calls do not negotiate layouts: each operand has to arrive in the default
     descending order. XLA, left alone, prefers a different one for the big activation
@@ -306,8 +311,19 @@ def pin_step_layouts(step, params, opt_state, xs, ys, mesh=None):
     instead. See `layout.descending_format`; it cannot be done from inside a traced
     function, which is why this wraps the caller's jit rather than living in the kernel.
 
-    Returns ``step`` unchanged if the running jax has no layout API.
+    **``in_shardings`` asserts a layout, it does not request one.** Passing a descending
+    `Format` for an argument that XLA has laid out some other way fails with "Layout passed
+    to jit does not match the layout on the respective arg", e.g. asking for
+    ``major_to_minor=(0, 1)`` on an ``in_proj`` that arrived as ``(1, 0)`` with ``(8, 128)``
+    tiling. So the arguments have to be moved into that layout first, with an eager
+    ``device_put``, which is why this returns them. ``out_shardings`` then keeps every later
+    step's output in the same layout, so the move happens once rather than per step.
     """
+    if mesh is None or L.Format is None:
+        # Nothing to pin without a mesh: single-device arrays have no NamedSharding to
+        # rebuild, and `eval_shape` reports `sharding=None` for every output.
+        return step, params, opt_state, None
+
     def in_format(x):
         """Descending `Format` for one input, or ``None`` for scalars.
 
@@ -317,14 +333,17 @@ def pin_step_layouts(step, params, opt_state, xs, ys, mesh=None):
         """
         return None if not getattr(x, "shape", ()) else L.descending_format(x)
 
-    if mesh is None or L.Format is None:
-        # Nothing to pin without a mesh: single-device arrays have no NamedSharding to
-        # rebuild, and `eval_shape` reports `sharding=None` for every output.
-        return step
+    def place(tree):
+        """Eagerly move each array in ``tree`` into its descending layout."""
+        def one(x):
+            fmt = in_format(x)
+            return x if fmt is None else jax.device_put(x, fmt)
 
-    fmts = tuple(
-        jax.tree.map(in_format, a) for a in (params, opt_state, xs, ys)
-    )
+        return jax.tree.map(one, tree)
+
+    params, opt_state = place(params), place(opt_state)
+    xs, ys = place(xs), place(ys)
+    fmts = tuple(jax.tree.map(in_format, a) for a in (params, opt_state, xs, ys))
 
     def out_format(s):
         """A descending `Format` for one output, or ``None`` to leave it unpinned.
@@ -351,9 +370,10 @@ def pin_step_layouts(step, params, opt_state, xs, ys, mesh=None):
     out_fmts = jax.tree.map(out_format, jax.eval_shape(step, params, opt_state, xs, ys))
     # Pin the outputs too. Doing only the inputs moves the conversion to the exit instead
     # of removing it.
-    return jax.jit(
+    pinned = jax.jit(
         step, in_shardings=fmts, out_shardings=out_fmts, donate_argnums=(0, 1)
     )
+    return pinned, params, opt_state, place
 
 
 def _flat_size(params: M.LMParams) -> int:
@@ -881,15 +901,19 @@ def main(argv: list[str] | None = None) -> int:
     stream = batches(data, global_batch, args.seqlen, jax.random.key(args.seed + 1))
 
     if args.pin_layouts:
+        # A throwaway batch just to shape the pin. `stream` is infinite so nothing is lost.
         xs0, ys0 = next(stream)
-        pinned = pin_step_layouts(
+        step, params, opt_state, pin_batch = pin_step_layouts(
             step, params, opt_state, shard_batch(xs0), shard_batch(ys0), mesh=mesh
         )
-        if pinned is step:
+        if pin_batch is None:
             print("layout pinning needs a multi chip mesh, continuing unpinned")
         else:
             print("layouts pinned at the step boundary")
-            step = pinned
+            # Every batch now has to arrive in the pinned layout too, since in_shardings
+            # asserts rather than requests.
+            base_batch = shard_batch
+            shard_batch = lambda t: pin_batch(base_batch(t))
 
     import optax as _optax  # local alias, already imported above
 
