@@ -203,6 +203,20 @@ path (Kaggle `/kaggle/input/...` mounts work).
 model shape comes from the file so you don't have to repeat the `--d-model`/`--n-layers`
 flags.
 
+Two flags for larger models on a v5e-8:
+
+- `--shard-optimizer` shards Adam's two moments across chips (ZeRO-1) instead of
+  replicating them. Saves `2 * params * 4 / n_dev` bytes per chip, 5.1 GiB at 787M on 8
+  chips, which is what lets a big model fit at a useful batch. Costs one all-gather of the
+  updates per step. The loss curve is identical, verified step for step.
+- `--pin-layouts` pins operand layouts at the step's jit boundary, worth ~20% of forward
+  time. Multi chip only, since there is no sharding to rebuild on a single device.
+
+```bash
+python -m mamba3_pallas.train --steps 2000 --d-model 2816 --n-layers 16 --batch 4 \
+    --seqlen 512 --chunk 512 --corpus enwik8 --shard-optimizer --pin-layouts
+```
+
 Training on your own text, pass `--prompt` too. The generation prefix defaults to something
 the named corpora contain (`[[The ` for enwik8, which is wiki link syntax) and a prompt your
 corpus never contains is out of distribution, so the first bytes come out as noise before

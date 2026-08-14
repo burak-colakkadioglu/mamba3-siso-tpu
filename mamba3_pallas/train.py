@@ -295,7 +295,100 @@ def bigram_baseline(data: np.ndarray) -> float:
 # --------------------------------------------------------------------------------------
 
 
-def make_step(cfg: M.LMConfig, opt, interpret: Any, mesh=None):
+def pin_step_layouts(step, params, opt_state, xs, ys, mesh=None):
+    """Re-jit ``step`` with every operand pinned to the descending layout.
+
+    Mosaic custom calls do not negotiate layouts: each operand has to arrive in the default
+    descending order. XLA, left alone, prefers a different one for the big activation
+    tensors because ``headdim=64`` against 128 lanes pads a 64-wide minor dim to 128, and
+    the mismatch is paid as a materializing copy on the way into and out of the kernel.
+    Pinning at a jit boundary makes XLA produce them in the layout the kernel wants
+    instead. See `layout.descending_format`; it cannot be done from inside a traced
+    function, which is why this wraps the caller's jit rather than living in the kernel.
+
+    Returns ``step`` unchanged if the running jax has no layout API.
+    """
+    def in_format(x):
+        """Descending `Format` for one input, or ``None`` for scalars.
+
+        Adam's step counter is rank 0. There is no layout to pin on a scalar and
+        ``in_shardings`` rejects a `Layout` whose sharding is absent, so those pass
+        through unpinned.
+        """
+        return None if not getattr(x, "shape", ()) else L.descending_format(x)
+
+    if mesh is None or L.Format is None:
+        # Nothing to pin without a mesh: single-device arrays have no NamedSharding to
+        # rebuild, and `eval_shape` reports `sharding=None` for every output.
+        return step
+
+    fmts = tuple(
+        jax.tree.map(in_format, a) for a in (params, opt_state, xs, ys)
+    )
+
+    def out_format(s):
+        """A descending `Format` for one output, or ``None`` to leave it unpinned.
+
+        Three things ``jax.eval_shape`` produces that ``out_shardings`` will not take:
+
+        * rank-0 outputs (the loss, Adam's step counter). No layout to get wrong.
+        * ``sharding=None``, which every output has on a single device. A `Layout` with no
+          sharding is rejected, and there is nothing to pin without a mesh anyway.
+        * shardings carrying an ``AbstractMesh``, which fail with
+          ``_device_assignment is not implemented for jax.sharding.AbstractMesh``. The spec
+          is the part that matters, so rebuild it against the real mesh.
+        """
+        if not getattr(s, "shape", ()):
+            return None
+        shd = getattr(s, "sharding", None)
+        if shd is None or mesh is None:
+            return None
+        from jax.sharding import NamedSharding
+
+        return L.Format(L.Layout(major_to_minor=tuple(range(len(s.shape)))),
+                        NamedSharding(mesh, shd.spec))
+
+    out_fmts = jax.tree.map(out_format, jax.eval_shape(step, params, opt_state, xs, ys))
+    # Pin the outputs too. Doing only the inputs moves the conversion to the exit instead
+    # of removing it.
+    return jax.jit(
+        step, in_shardings=fmts, out_shardings=out_fmts, donate_argnums=(0, 1)
+    )
+
+
+def _flat_size(params: M.LMParams) -> int:
+    """Total scalar count of a params tree."""
+    return sum(int(x.size) for x in jax.tree.leaves(params))
+
+
+def init_optimizer(opt, params: M.LMParams, mesh=None, shard_state: bool = False):
+    """``(opt_state, flat_spec)``. With ``shard_state`` the state is a sharded flat vector.
+
+    Adam keeps two moments the size of the params, and data parallelism replicates them on
+    every chip. At 787M f32 that is 5.87 GiB per chip of pure optimizer state, which is
+    what stops a model that size from training on a v5e even after donation.
+
+    ``shard_state=True`` is ZeRO-1: ravel the params into one 1-D vector, shard it over the
+    mesh, and keep the moments only for the local slice. Each chip then holds
+    ``2 * P / n_dev`` scalars instead of ``2 * P``. Params themselves stay replicated, so
+    the forward is unchanged and the cost is one all-gather of the updates per step.
+
+    Returns ``flat_spec = None`` when not sharding, so `make_step` knows which path to take.
+    """
+    if not (shard_state and mesh is not None):
+        return opt.init(params), None
+
+    from jax.sharding import NamedSharding, PartitionSpec as P
+
+    n_dev = mesh.devices.size
+    size = _flat_size(params)
+    padded = -(-size // n_dev) * n_dev          # ceil to a whole number of shards
+    spec = NamedSharding(mesh, P("data"))
+    flat = jax.device_put(jnp.zeros((padded,), jnp.float32), spec)
+    return opt.init(flat), (size, padded, spec, NamedSharding(mesh, P()))
+
+
+def make_step(cfg: M.LMConfig, opt, interpret: Any, mesh=None, flat_spec=None):
     """One jitted AdamW step. Returns ``(loss, params, opt_state)``.
 
     With ``mesh``, the batch is split across every chip and the layer runs under
@@ -324,6 +417,12 @@ def make_step(cfg: M.LMConfig, opt, interpret: Any, mesh=None):
     opt_state through the return value and must not hold a second reference to either. In
     particular a "best so far" snapshot has to be a real copy, not an identity
     ``tree.map``, which only rebuilds the tree around the same buffers.
+
+    Args:
+      flat_spec: From `init_optimizer` with ``shard_state=True``. Switches the update to
+        the sharded-optimizer path. The Adam math is elementwise on the flat vector, so
+        GSPMD partitions it from the sharding constraints alone; only the kernel needs
+        ``shard_map``, and that stays inside ``grad_fn``.
     """
     import optax
 
@@ -358,11 +457,45 @@ def make_step(cfg: M.LMConfig, opt, interpret: Any, mesh=None):
         check_vma=False,
     )
 
+    if flat_spec is None:
+        @functools.partial(jax.jit, donate_argnums=(0, 1))
+        def step(params, opt_state, xs, ys):
+            loss, grads = grad_fn(params, xs, ys)
+            updates, opt_state = opt.update(grads, opt_state, params)
+            return loss, optax.apply_updates(params, updates), opt_state
+
+        return step
+
+    size, padded, shard, repl = flat_spec
+    # `jax.make_mesh` builds Explicit axes, and `with_sharding_constraint` only accepts
+    # Auto ones ("You probably meant to use `reshard`"). `reshard` is the Explicit-mesh
+    # equivalent and is what moves the flat vector between sharded and replicated.
+    from jax.sharding import reshard
+
+    def flatten(tree):
+        flat = jnp.concatenate([x.reshape(-1) for x in jax.tree.leaves(tree)])
+        if padded > size:
+            flat = jnp.pad(flat, (0, padded - size))
+        return reshard(flat, shard)
+
     @functools.partial(jax.jit, donate_argnums=(0, 1))
     def step(params, opt_state, xs, ys):
         loss, grads = grad_fn(params, xs, ys)
-        updates, opt_state = opt.update(grads, opt_state, params)
-        return loss, optax.apply_updates(params, updates), opt_state
+        # Ravel to one vector and shard it, so Adam's moments only ever exist per shard.
+        # The padding tail carries zero gradient, so it stays at zero and never
+        # contributes to an update.
+        flat_g = flatten(grads)
+        flat_p = flatten(params)
+        updates, opt_state = opt.update(flat_g, opt_state, flat_p)
+        new_flat = optax.apply_updates(flat_p, updates)
+        # One all-gather per step: params stay replicated so the forward is untouched.
+        new_flat = reshard(new_flat, repl)
+        leaves, treedef = jax.tree.flatten(params)
+        out, off = [], 0
+        for leaf in leaves:
+            out.append(new_flat[off : off + leaf.size].reshape(leaf.shape))
+            off += int(leaf.size)
+        return loss, jax.tree.unflatten(treedef, out), opt_state
 
     return step
 
@@ -583,6 +716,18 @@ def main(argv: list[str] | None = None) -> int:
         help="use enwik8's exact benchmark split (train on the first 90M bytes, test on "
              "the last 5M). The only setting whose bpc is comparable to published numbers.",
     )
+    ap.add_argument(
+        "--shard-optimizer", action="store_true",
+        help="shard Adam's moments across chips (ZeRO-1) instead of replicating them. "
+             "Saves 2*params*4/n_dev bytes per chip, which is what lets a large model fit; "
+             "costs one all-gather of the updates per step. Multi chip only.",
+    )
+    ap.add_argument(
+        "--pin-layouts", action="store_true",
+        help="pin operand layouts at the step's jit boundary. Mosaic needs the default "
+             "descending layout and XLA prefers another when headdim=64, and the mismatch "
+             "is paid as a transposing copy. Worth ~20% of forward time.",
+    )
     ap.add_argument("--temperature", type=float, default=0.9)
     ap.add_argument("--top-p", type=float, default=0.95)
     ap.add_argument("--rep-penalty", type=float, default=1.15,
@@ -710,13 +855,10 @@ def main(argv: list[str] | None = None) -> int:
         decay_steps=max(args.steps, args.warmup + 1), end_value=args.lr * 0.1,
     )
     opt = optax.chain(optax.clip_by_global_norm(1.0), optax.adamw(sched, weight_decay=0.1))
-    opt_state = opt.init(params)
-    step = make_step(cfg, opt, interpret, mesh=mesh)
-    stream = batches(data, global_batch, args.seqlen, jax.random.key(args.seed + 1))
 
     # `shard_map` rejects arguments whose sharding does not already match `in_specs` --
-    # it will not reshard for you. So params and optimizer state are placed replicated
-    # once here, and each batch is placed sharded on the way in.
+    # it will not reshard for you. So params are placed replicated once here, and each
+    # batch is placed sharded on the way in.
     if mesh is None:
         shard_batch = lambda t: t
     else:
@@ -726,8 +868,28 @@ def main(argv: list[str] | None = None) -> int:
         sh = NamedSharding(mesh, P("data"))
         place = lambda t: jax.device_put(t, repl) if hasattr(t, "shape") else t
         params = jax.tree.map(place, params)
-        opt_state = jax.tree.map(place, opt_state)
         shard_batch = lambda t: jax.device_put(t, sh)
+
+    # Optimizer state after params are placed, so a sharded flat vector lands on the
+    # right mesh.
+    opt_state, flat_spec = init_optimizer(
+        opt, params, mesh=mesh, shard_state=args.shard_optimizer
+    )
+    if flat_spec is None and mesh is not None:
+        opt_state = jax.tree.map(place, opt_state)
+    step = make_step(cfg, opt, interpret, mesh=mesh, flat_spec=flat_spec)
+    stream = batches(data, global_batch, args.seqlen, jax.random.key(args.seed + 1))
+
+    if args.pin_layouts:
+        xs0, ys0 = next(stream)
+        pinned = pin_step_layouts(
+            step, params, opt_state, shard_batch(xs0), shard_batch(ys0), mesh=mesh
+        )
+        if pinned is step:
+            print("layout pinning needs a multi chip mesh, continuing unpinned")
+        else:
+            print("layouts pinned at the step boundary")
+            step = pinned
 
     import optax as _optax  # local alias, already imported above
 

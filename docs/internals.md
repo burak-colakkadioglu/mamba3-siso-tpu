@@ -240,9 +240,19 @@ keeps it out of HBM.
 
 Also worth knowing: this floor is independent of `seqlen`. The model is recurrent, activation
 memory per step doesn't grow with sequence length the way attention's does, so shortening
-the sequence does not help an OOM that is really about parameter copies. Optimizer state is
-the next thing to attack (sharding Adam's moments across chips would save ~5 GiB at 787M);
-that isn't implemented.
+the sequence does not help an OOM that is really about parameter copies. What does help is
+`--shard-optimizer`: Adam's two moments are the only replicated state that has no reason to
+be replicated, since each element's update depends only on that element. Raveling the params
+into one vector, sharding it over the mesh and keeping moments for the local slice turns
+`2 * P * 4` bytes per chip into `2 * P * 4 / n_dev`, 5.87 GiB down to 0.73 GiB at 787M on 8
+chips. The cost is one all-gather of the updates per step; params stay replicated so the
+forward is untouched.
+
+Two API details that path ran into. `jax.make_mesh` builds `Explicit` axes, and
+`with_sharding_constraint` only accepts `Auto` ones, so the sharded/replicated moves use
+`jax.sharding.reshard`. And `jax.eval_shape` reports shardings carrying an `AbstractMesh`,
+which `out_shardings` rejects (`_device_assignment is not implemented`), so the specs get
+rebuilt against the concrete mesh.
 
 ## Numerics
 
